@@ -96,19 +96,22 @@ class UpdateService {
           }
         }
         if (apkAsset == null) return null;
+        // SHA zorunlu: .apk.sha256 yoksa veya içeriği geçersizse güncelleme sunulmaz.
+        if (shaAsset == null) return null;
 
         // 4) SHA256 yan dosyasının içeriği (küçük metin dosyası).
-        var expectedSha = '';
-        if (shaAsset != null) {
-          expectedSha = await _fetchSha256(
-              client, (shaAsset['browser_download_url'] as String?) ?? '');
-        }
+        final expectedSha = await _fetchSha256(
+            client, (shaAsset['browser_download_url'] as String?) ?? '');
+        if (expectedSha.isEmpty) return null;
+
+        final apkUrl = (apkAsset['browser_download_url'] as String?) ?? '';
+        if (apkUrl.isEmpty) return null;
 
         return UpdateInfo(
           version: version,
           size: (apkAsset['size'] as num?)?.toInt() ?? 0,
           sha256: expectedSha,
-          url: (apkAsset['browser_download_url'] as String?) ?? '',
+          url: apkUrl,
           notes: ((map['body'] as String?) ?? '').trim(),
         );
       } finally {
@@ -192,11 +195,19 @@ class UpdateService {
   }
 
   /// İndirilen dosyanın SHA256'sı beklenen özetle eşleşiyor mu?
+  /// Beklenen özet boşsa veya biçim geçersizse **asla** true dönmez.
   static Future<bool> verifySha256(File file, String expected) async {
-    if (expected.isEmpty) return true;
+    final want = expected.trim().toLowerCase();
+    if (!RegExp(r'^[0-9a-f]{64}$').hasMatch(want)) return false;
+    if (!await file.exists()) return false;
     final digest = await sha256.bind(file.openRead()).first;
-    return digest.toString().toLowerCase() == expected.toLowerCase();
+    return digest.toString().toLowerCase() == want;
   }
+
+  /// Birim testleri için sürüm karşılaştırmasını dışa açar.
+  @visibleForTesting
+  static bool isNewerVersion(String remote, String current) =>
+      _isNewer(remote, current);
 
   /// Android kurucuyu açar (FileProvider üzerinden).
   static Future<void> install(File file) async {

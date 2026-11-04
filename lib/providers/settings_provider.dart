@@ -26,6 +26,14 @@ class SettingsProvider extends ChangeNotifier {
   static const _kDynamicColor = 'dynamic_color';
   static const _kAppearance = 'appearance';
   static const _kHiddenHomeCategories = 'hidden_home_categories';
+  static const _kShowBookmarkMenu = 'show_bookmark_menu';
+  static const _kShowAddToHomeMenu = 'show_add_to_home_menu';
+  static const _kShowHideToggleMenu = 'show_hide_toggle_menu';
+  static const _kShowOpenWithMenu = 'show_open_with_menu';
+  static const _kShowHiddenFiles = 'show_hidden_files';
+  static const _kForceDualPane = 'force_dual_pane';
+  static const _kDropAction = 'drop_action'; // ask | copy | move
+  static const _kDualPaneMinWidth = 'dual_pane_min_width';
 
   static Future<SettingsProvider> load() async =>
       SettingsProvider(await SharedPreferences.getInstance());
@@ -58,7 +66,9 @@ class SettingsProvider extends ChangeNotifier {
     notifyListeners();
   }
 
-  bool get recycleBinDefault => _prefs.getBool(_kRecycleBinDefault) ?? true;
+  /// Varsayılan: kapalı — F Dosya Yöneticisi gibi doğrudan kalıcı silme.
+  /// Açılırsa silinenler uygulama geri dönüşüm kutusuna taşınır.
+  bool get recycleBinDefault => _prefs.getBool(_kRecycleBinDefault) ?? false;
 
   set recycleBinDefault(bool value) {
     _prefs.setBool(_kRecycleBinDefault, value);
@@ -225,4 +235,72 @@ class SettingsProvider extends ChangeNotifier {
   /// gizli kart kavramı bilinçli olarak yoktur — yeni bir kart eklendiğinde
   /// kullanıcı onu istemediği sürece görünür başlar.
   void resetHiddenHomeCategories() => hiddenHomeCategories = <String>{};
+
+  /// Satır menüsünde "Yer imine ekle" görünsün mü?
+  bool get showBookmarkMenu => _prefs.getBool(_kShowBookmarkMenu) ?? true;
+
+  set showBookmarkMenu(bool value) {
+    _prefs.setBool(_kShowBookmarkMenu, value);
+    notifyListeners();
+  }
+
+  /// Satır menüsünde "Ana ekrana ekle" görünsün mü?
+  bool get showAddToHomeMenu => _prefs.getBool(_kShowAddToHomeMenu) ?? true;
+
+  set showAddToHomeMenu(bool value) {
+    _prefs.setBool(_kShowAddToHomeMenu, value);
+    notifyListeners();
+  }
+
+  /// Tarayıcı menüsünde "Gizli dosyaları göster" anahtarı görünsün mü?
+  bool get showHideToggleMenu => _prefs.getBool(_kShowHideToggleMenu) ?? true;
+
+  set showHideToggleMenu(bool value) {
+    _prefs.setBool(_kShowHideToggleMenu, value);
+    notifyListeners();
+  }
+
+  /// Satır menüsünde "Farklı aç" görünsün mü?
+  bool get showOpenWithMenu => _prefs.getBool(_kShowOpenWithMenu) ?? true;
+
+  set showOpenWithMenu(bool value) {
+    _prefs.setBool(_kShowOpenWithMenu, value);
+    notifyListeners();
+  }
+
+  /// Nokta ile başlayan gizli dosya/klasörler listelensin mi?
+  bool get showHiddenFiles => _prefs.getBool(_kShowHiddenFiles) ?? false;
+
+  set showHiddenFiles(bool value) {
+    _prefs.setBool(_kShowHiddenFiles, value);
+    notifyListeners();
+  }
+
+  /// Telefon dahil çift bölmeli tarayıcıyı zorla (Solid Explorer tarzı).
+  ///
+  /// Kapalıyken yalnızca genişlik eşiği (≥ [dualPaneMinWidth]) aşılırsa
+  /// çift panel açılır.
+  bool get forceDualPane => _prefs.getBool(_kForceDualPane) ?? false;
+
+  set forceDualPane(bool value) {
+    _prefs.setBool(_kForceDualPane, value);
+    notifyListeners();
+  }
+
+  /// Çift panel eşiği (px). Varsayılan 900; telefonda yatay kullanım için
+  /// 600'e indirilebilir.
+  int get dualPaneMinWidth => _prefs.getInt(_kDualPaneMinWidth) ?? 900;
+
+  set dualPaneMinWidth(int value) {
+    _prefs.setInt(_kDualPaneMinWidth, value.clamp(480, 1200));
+    notifyListeners();
+  }
+
+  /// Sürükle-bırak eylemi: `ask` (sor), `copy`, `move`.
+  String get dropAction => _prefs.getString(_kDropAction) ?? 'ask';
+
+  set dropAction(String value) {
+    _prefs.setString(_kDropAction, value);
+    notifyListeners();
+  }
 }

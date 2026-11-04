@@ -7,6 +7,8 @@ import '../services/remote_service.dart';
 import '../services/sftp_service.dart';
 import '../services/smb_client.dart';
 import '../services/webdav_service.dart';
+import '../widgets/app_drawer.dart';
+import '../widgets/tv_focusable.dart';
 import 'ftp_browse_screen.dart';
 import 'lan_scan_screen.dart';
 import 'sftp_browse_screen.dart';
@@ -127,9 +129,178 @@ class _RemoteScreenState extends State<RemoteScreen> {
       ),
     );
     if (confirmed != true) return;
+    final i = _locations.indexOf(loc);
+    if (i < 0) return;
     await _persist(
-      List<RemoteLocation>.of(_locations)..remove(loc),
+      List<RemoteLocation>.of(_locations)..removeAt(i),
       successMessage: '"${loc.name}" kaldırıldı',
+    );
+  }
+
+  /// Ad / sunucu / şifre vb. tüm alanları düzenler (silip yeniden eklemeye gerek yok).
+  Future<void> _edit(RemoteLocation loc) async {
+    final i = _locations.indexOf(loc);
+    if (i < 0) return;
+    final edited = await showDialog<RemoteLocation>(
+      context: context,
+      builder: (_) => RemoteFormDialog(
+        initialType: loc.type,
+        defaults: loc,
+        editing: true,
+      ),
+    );
+    if (edited == null || !mounted) return;
+    final next = List<RemoteLocation>.of(_locations);
+    next[i] = edited;
+    await _persist(next, successMessage: '"${edited.name}" güncellendi ✅');
+  }
+
+  /// Yalnızca görünen adı değiştirir (hızlı düzeltme).
+  Future<void> _rename(RemoteLocation loc) async {
+    final i = _locations.indexOf(loc);
+    if (i < 0) return;
+    final controller = TextEditingController(text: loc.name);
+    final name = await showDialog<String>(
+      context: context,
+      builder: (context) => AlertDialog(
+        title: const Text('Yeniden adlandır'),
+        content: TextField(
+          controller: controller,
+          autofocus: true,
+          decoration: const InputDecoration(labelText: 'Bağlantı adı'),
+          onSubmitted: (v) => Navigator.pop(context, v.trim()),
+        ),
+        actions: [
+          TextButton(
+            onPressed: () => Navigator.pop(context),
+            child: const Text('Vazgeç'),
+          ),
+          FilledButton(
+            onPressed: () => Navigator.pop(context, controller.text.trim()),
+            child: const Text('Kaydet'),
+          ),
+        ],
+      ),
+    );
+    if (name == null || name.isEmpty || name == loc.name) return;
+    final next = List<RemoteLocation>.of(_locations);
+    next[i] = loc.copyWith(name: name);
+    await _persist(next, successMessage: 'Ad "$name" olarak güncellendi');
+  }
+
+  /// Aynı ayarlarla yeni kayıt (adına "kopya" eklenir).
+  Future<void> _duplicate(RemoteLocation loc) async {
+    final copy = loc.copyWith(name: '${loc.name} (kopya)');
+    await _persist(
+      List<RemoteLocation>.of(_locations)..add(copy),
+      successMessage: '"${copy.name}" eklendi',
+    );
+  }
+
+  Future<void> _testSaved(RemoteLocation loc) async {
+    final messenger = ScaffoldMessenger.of(context);
+    messenger
+      ..hideCurrentSnackBar()
+      ..showSnackBar(const SnackBar(content: Text('Bağlantı test ediliyor…')));
+    try {
+      switch (loc.type) {
+        case 'sftp':
+          final session = await SftpSession.connect(loc);
+          await session.close();
+        case 'smb':
+          final client = await SmbClient.connect(loc);
+          await client.list('');
+          await client.close();
+        case 'webdav':
+          await WebDavService().list(
+            CloudLocation(
+              name: loc.name,
+              provider: 'WebDAV',
+              url: WebDavService.normalizeUrl(loc.host),
+              username: loc.username,
+              password: loc.password,
+            ),
+          );
+        default:
+          await const FtpClientService().test(loc);
+      }
+      if (!mounted) return;
+      messenger
+        ..hideCurrentSnackBar()
+        ..showSnackBar(
+            const SnackBar(content: Text('Bağlantı başarılı ✅')));
+    } catch (e) {
+      if (!mounted) return;
+      messenger
+        ..hideCurrentSnackBar()
+        ..showSnackBar(
+            SnackBar(content: Text('Bağlantı başarısız: ${_friendlyError(e)}')));
+    }
+  }
+
+  void _showItemMenu(RemoteLocation loc) {
+    showModalBottomSheet<void>(
+      context: context,
+      isScrollControlled: true,
+      builder: (context) => SafeArea(
+        child: SingleChildScrollView(
+          child: Column(
+            mainAxisSize: MainAxisSize.min,
+            children: [
+              ListTile(
+                leading: const Icon(Icons.link_rounded),
+                title: Text(loc.name),
+                subtitle: Text(_subtitle(loc)),
+              ),
+              const Divider(height: 1),
+              ListTile(
+                leading: const Icon(Icons.edit_rounded),
+                title: const Text('Düzenle'),
+                subtitle: const Text('Ad, sunucu, şifre ve diğer alanlar'),
+                onTap: () {
+                  Navigator.pop(context);
+                  _edit(loc);
+                },
+              ),
+              ListTile(
+                leading: const Icon(Icons.drive_file_rename_outline_rounded),
+                title: const Text('Yeniden adlandır'),
+                onTap: () {
+                  Navigator.pop(context);
+                  _rename(loc);
+                },
+              ),
+              ListTile(
+                leading: const Icon(Icons.copy_rounded),
+                title: const Text('Çoğalt'),
+                onTap: () {
+                  Navigator.pop(context);
+                  _duplicate(loc);
+                },
+              ),
+              ListTile(
+                leading: const Icon(Icons.network_check_rounded),
+                title: const Text('Bağlantıyı test et'),
+                onTap: () {
+                  Navigator.pop(context);
+                  _testSaved(loc);
+                },
+              ),
+              ListTile(
+                leading: Icon(Icons.delete_outline_rounded,
+                    color: Theme.of(context).colorScheme.error),
+                title: Text('Sil',
+                    style:
+                        TextStyle(color: Theme.of(context).colorScheme.error)),
+                onTap: () {
+                  Navigator.pop(context);
+                  _delete(loc);
+                },
+              ),
+            ],
+          ),
+        ),
+      ),
     );
   }
 
@@ -152,15 +323,18 @@ class _RemoteScreenState extends State<RemoteScreen> {
 
   String _subtitle(RemoteLocation loc) => switch (loc.type) {
         'smb' =>
-          '\\\\${loc.host}\\${loc.share.isEmpty ? r'C$' : loc.share} '
+          '\\\\${loc.cleanHost}\\${loc.share.isEmpty ? r'C$' : loc.share} '
               '(${loc.username.isEmpty ? 'misafir' : loc.username})',
         'webdav' => loc.host,
-        _ => '${loc.username}@${loc.host}:${loc.port}${loc.startPath}',
+        _ =>
+            '${loc.username.isEmpty ? 'anonymous' : loc.username}'
+            '@${loc.cleanHost}:${loc.effectivePort}${loc.startPath}',
       };
 
   @override
   Widget build(BuildContext context) {
     return Scaffold(
+      drawer: const AppDrawer(),
       appBar: AppBar(title: const Text('Uzak')),
       floatingActionButton: FloatingActionButton.extended(
         onPressed: _add,
@@ -181,8 +355,10 @@ class _RemoteScreenState extends State<RemoteScreen> {
                         const SizedBox(height: 16),
                         const Text(
                           'Henüz uzak konum eklenmedi.\n'
-                          'Yerel ağda SMB/FTP sunucusu bulmak için '
-                          '"Yerel Ağ" türünü seçin.',
+                          'WebDAV / Nextcloud, SMB, FTP veya SFTP '
+                          'ekleyin; yerel ağ taraması da kullanılabilir.\n'
+                          '(Google Drive vb. bulut OAuth doğrulanınca '
+                          'ayrı kart olarak açılacak.)',
                           textAlign: TextAlign.center,
                         ),
                         const SizedBox(height: 16),
@@ -195,20 +371,40 @@ class _RemoteScreenState extends State<RemoteScreen> {
                     ),
                   ),
                 )
-              : ListView.builder(
+              : ReorderableListView.builder(
                   padding: const EdgeInsets.only(bottom: 88),
                   itemCount: _locations.length,
+                  onReorderItem: (oldIndex, newIndex) async {
+                    setState(() {
+                      final item = _locations.removeAt(oldIndex);
+                      _locations.insert(newIndex, item);
+                    });
+                    await RemoteLocationStore.save(_locations);
+                  },
                   itemBuilder: (context, index) {
                     final loc = _locations[index];
-                    return ListTile(
-                      leading: Icon(_icon(loc), color: const Color(0xFF00897B)),
-                      title: Text(loc.name),
-                      subtitle: Text(_subtitle(loc)),
-                      trailing: IconButton(
-                        icon: const Icon(Icons.delete_outline_rounded),
-                        onPressed: () => _delete(loc),
+                    return TvFocusable(
+                      key: ValueKey(
+                          '${loc.type}:${loc.host}:${loc.port}:${loc.name}:$index'),
+                      autofocus: index == 0,
+                      onActivate: () => _open(loc),
+                      scale: 1.02,
+                      child: ListTile(
+                        leading: ReorderableDragStartListener(
+                          index: index,
+                          child: Icon(_icon(loc),
+                              color: const Color(0xFF00897B)),
+                        ),
+                        title: Text(loc.name),
+                        subtitle: Text(_subtitle(loc)),
+                        trailing: IconButton(
+                          icon: const Icon(Icons.more_vert_rounded),
+                          tooltip: 'Düzenle / sil',
+                          onPressed: () => _showItemMenu(loc),
+                        ),
+                        onTap: () => _open(loc),
+                        onLongPress: () => _showItemMenu(loc),
                       ),
-                      onTap: () => _open(loc),
                     );
                   },
                 ),
@@ -256,7 +452,7 @@ class _TypePickerDialog extends StatelessWidget {
         _tile(
           context,
           icon: Icons.cloud_rounded,
-          title: 'WebDAV',
+          title: 'WebDAV / Nextcloud',
           subtitle: 'Nextcloud, ownCloud, pCloud vb.',
           type: 'webdav',
         ),
@@ -292,10 +488,14 @@ class RemoteFormDialog extends StatefulWidget {
     super.key,
     required this.initialType,
     this.defaults,
+    this.editing = false,
   });
 
   final String initialType;
   final RemoteLocation? defaults;
+
+  /// true ise başlık "düzenle" olur; tür değiştirilemez.
+  final bool editing;
 
   @override
   State<RemoteFormDialog> createState() => _RemoteFormDialogState();
@@ -309,6 +509,7 @@ class _RemoteFormDialogState extends State<RemoteFormDialog> {
   late final TextEditingController _share;
   late final TextEditingController _username;
   late final TextEditingController _password;
+  late final TextEditingController _startPath;
   late String _type;
   bool _testing = false;
 
@@ -330,6 +531,7 @@ class _RemoteFormDialogState extends State<RemoteFormDialog> {
     _share = TextEditingController(text: d?.share ?? '');
     _username = TextEditingController(text: d?.username ?? '');
     _password = TextEditingController(text: d?.password ?? '');
+    _startPath = TextEditingController(text: d?.startPath ?? '/');
   }
 
   @override
@@ -340,6 +542,7 @@ class _RemoteFormDialogState extends State<RemoteFormDialog> {
     _share.dispose();
     _username.dispose();
     _password.dispose();
+    _startPath.dispose();
     super.dispose();
   }
 
@@ -351,6 +554,7 @@ class _RemoteFormDialogState extends State<RemoteFormDialog> {
         username: _username.text.trim(),
         password: _password.text,
         share: _share.text.trim(),
+        startPath: _startPath.text.trim().isEmpty ? '/' : _startPath.text.trim(),
       );
 
   Future<void> _test() async {
@@ -371,7 +575,7 @@ class _RemoteFormDialogState extends State<RemoteFormDialog> {
             CloudLocation(
               name: loc.name,
               provider: 'WebDAV',
-              url: loc.host,
+              url: WebDavService.normalizeUrl(loc.host),
               username: loc.username,
               password: loc.password,
             ),
@@ -403,7 +607,15 @@ class _RemoteFormDialogState extends State<RemoteFormDialog> {
 
   void _save() {
     if (!(_formKey.currentState?.validate() ?? false)) return;
-    Navigator.of(context).pop(_location());
+    final loc = _location();
+    // WebDAV: kaydederken URL normalize (https öneki).
+    if (loc.type == 'webdav') {
+      Navigator.of(context).pop(
+        loc.copyWith(host: WebDavService.normalizeUrl(loc.host)),
+      );
+      return;
+    }
+    Navigator.of(context).pop(loc);
   }
 
   @override
@@ -411,7 +623,9 @@ class _RemoteFormDialogState extends State<RemoteFormDialog> {
     final isSmb = _type == 'smb';
     final isWebDav = _type == 'webdav';
     return AlertDialog(
-      title: Text('${_type.toUpperCase()} konumu ekle'),
+      title: Text(widget.editing
+          ? '${_type.toUpperCase()} konumunu düzenle'
+          : '${_type.toUpperCase()} konumu ekle'),
       content: SingleChildScrollView(
         child: Form(
           key: _formKey,
@@ -421,13 +635,19 @@ class _RemoteFormDialogState extends State<RemoteFormDialog> {
               TextFormField(
                 controller: _name,
                 decoration: const InputDecoration(labelText: 'Bağlantı adı'),
+                autofocus: widget.editing,
               ),
               const SizedBox(height: 12),
               TextFormField(
                 controller: _host,
                 decoration: InputDecoration(
                   labelText: isWebDav ? 'Adres (URL)' : 'Sunucu (host / IP)',
-                  hintText: isWebDav ? 'https://sunucu/dav/yol' : null,
+                  hintText: isWebDav
+                      ? 'https://sunucu/remote.php/dav/files/kullanici'
+                      : '192.168.1.10 veya smb://192.168.1.10',
+                  helperText: isWebDav
+                      ? 'Şema yoksa https:// eklenir (Nextcloud/ownCloud)'
+                      : 'ftp:// veya smb:// ile yapıştırabilirsiniz',
                 ),
                 validator: (v) => (v == null || v.trim().isEmpty)
                     ? 'Sunucu adresi gerekli'
@@ -437,7 +657,14 @@ class _RemoteFormDialogState extends State<RemoteFormDialog> {
                 const SizedBox(height: 12),
                 TextFormField(
                   controller: _port,
-                  decoration: const InputDecoration(labelText: 'Port'),
+                  decoration: InputDecoration(
+                    labelText: 'Port',
+                    helperText: switch (_type) {
+                      'sftp' => 'Varsayılan 22',
+                      'smb' => 'Varsayılan 445',
+                      _ => 'Varsayılan 21',
+                    },
+                  ),
                   keyboardType: TextInputType.number,
                 ),
               ],
@@ -452,6 +679,16 @@ class _RemoteFormDialogState extends State<RemoteFormDialog> {
                   validator: (v) => (v == null || v.trim().isEmpty)
                       ? 'Paylaşım adı gerekli (örn. C\$)'
                       : null,
+                ),
+              ],
+              if (!isSmb && !isWebDav) ...[
+                const SizedBox(height: 12),
+                TextFormField(
+                  controller: _startPath,
+                  decoration: const InputDecoration(
+                    labelText: 'Başlangıç yolu',
+                    hintText: '/',
+                  ),
                 ),
               ],
               const SizedBox(height: 12),
@@ -488,7 +725,7 @@ class _RemoteFormDialogState extends State<RemoteFormDialog> {
         ),
         FilledButton(
           onPressed: _testing ? null : _save,
-          child: const Text('Kaydet'),
+          child: Text(widget.editing ? 'Güncelle' : 'Kaydet'),
         ),
       ],
     );

@@ -101,6 +101,7 @@ class TransferResult {
     required this.files,
     required this.bytes,
     required this.cancelled,
+    this.warning,
   });
 
   /// Taşınan/kopyalanan dosya sayısı.
@@ -112,7 +113,11 @@ class TransferResult {
   /// Kullanıcı iptal ettiyse `true`.
   final bool cancelled;
 
+  /// Kısmi başarı uyarısı (ör. kopyalandı ama kaynak silinemedi).
+  final String? warning;
+
   @override
   String toString() =>
-      'TransferResult($files dosya, $bytes bayt, cancelled: $cancelled)';
+      'TransferResult($files dosya, $bytes bayt, cancelled: $cancelled'
+      '${warning == null ? '' : ', warning: $warning'})';
 }

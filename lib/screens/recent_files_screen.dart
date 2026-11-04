@@ -1,3 +1,4 @@
+import 'dart:async';
 import 'dart:io';
 import 'dart:isolate';
 
@@ -11,10 +12,13 @@ import '../services/category_size_service.dart';
 import '../services/clipboard_manager.dart';
 import '../services/file_service.dart';
 import '../services/recycle_bin_service.dart';
+import '../utils/app_paths.dart';
 import '../utils/debug_log.dart';
 import '../utils/formats.dart';
+import '../utils/folder_watcher.dart';
 import '../services/recent_seen_store.dart';
 import '../utils/file_opener.dart' show kAudioExts, kImageExts, kVideoExts;
+import '../widgets/tv_focusable.dart';
 import 'image_viewer_screen.dart';
 import 'media_viewer_screen.dart';
 
@@ -75,16 +79,35 @@ class _RecentFilesScreenState extends State<RecentFilesScreen>
   /// gösterir; dosyalar hiçbir durumda silinmez.
   bool _cleared = false;
 
+  /// Canlı izleme: sıcak klasörler + debounce (F Dosya Yöneticisi hissi).
+  late final FolderWatcher _watcher = FolderWatcher(
+    onChanged: _onStorageChanged,
+    // Tam cihaz taraması ağır; biraz daha birleştirerek çift tarama önlenir.
+    debounce: const Duration(milliseconds: 900),
+    settleFollowUp: const Duration(milliseconds: 1800),
+    pollInterval: const Duration(seconds: 4),
+  );
+
+  int _loadGen = 0;
+  bool _sizesDirty = false;
+  Timer? _sizeRefreshTimer;
+
   @override
   void initState() {
     super.initState();
     WidgetsBinding.instance.addObserver(this);
     _load();
+    _startWatching();
   }
 
   @override
   void dispose() {
     WidgetsBinding.instance.removeObserver(this);
+    _watcher.dispose();
+    _sizeRefreshTimer?.cancel();
+    if (_sizesDirty) {
+      unawaited(CategorySizeService.invalidate());
+    }
     super.dispose();
   }
 
@@ -93,16 +116,57 @@ class _RecentFilesScreenState extends State<RecentFilesScreen>
   /// değiştirebilir; liste eski boyutu göstermeye devam etmemeli.
   @override
   void didChangeAppLifecycleState(AppLifecycleState state) {
-    if (state == AppLifecycleState.resumed && mounted) _load();
+    if (state == AppLifecycleState.resumed && mounted) {
+      unawaited(_load(preserveSelection: true));
+    }
   }
 
-  Future<void> _load() async {
-    // Tarama kökü: Android ana depolama, diğer platformlarda kullanıcı klasörü.
-    final root = widget.root ??
-        (Platform.isAndroid
-            ? '/storage/emulated/0'
-            : (Platform.environment['USERPROFILE'] ??
-                Directory.systemTemp.path));
+  String get _scanRoot =>
+      widget.root ?? AppPaths.scanRoot;
+
+  void _startWatching() {
+    final root = _scanRoot;
+    final sep = Platform.pathSeparator;
+    // Yeni dosyaların çoğu bu klasörlere düşer; kökün tamamını recursive
+    // izlemek pahalı ve gürültülüdür.
+    const hot = [
+      'Download',
+      'Downloads',
+      'Documents',
+      'DCIM',
+      'Pictures',
+      'Movies',
+      'Music',
+      'WhatsApp',
+      'Telegram',
+    ];
+    final paths = <String>[
+      for (final name in hot)
+        if (Directory('$root$sep$name').existsSync()) '$root$sep$name',
+    ];
+    // Test / özel kök: sıcak klasör yoksa kökü izle.
+    if (paths.isEmpty) paths.add(root);
+    _watcher.start(paths, recursive: true);
+  }
+
+  void _onStorageChanged() {
+    if (!mounted || _working) return;
+    unawaited(_load(preserveSelection: true));
+    _scheduleSizeRefresh();
+  }
+
+  void _scheduleSizeRefresh() {
+    _sizesDirty = true;
+    _sizeRefreshTimer ??= Timer(const Duration(seconds: 2), () {
+      _sizeRefreshTimer = null;
+      _sizesDirty = false;
+      unawaited(CategorySizeService.invalidate());
+    });
+  }
+
+  Future<void> _load({bool preserveSelection = false}) async {
+    final root = _scanRoot;
+    final gen = ++_loadGen;
 
     // İzolat, kapanış (closure) gönderilmeden başlatılır: test/sanal alan
     // gibi özel Zone'larda `Isolate.run` gönderilemez nesne hatası verir.
@@ -113,26 +177,36 @@ class _RecentFilesScreenState extends State<RecentFilesScreen>
         _ScanRequest(root: root, limit: 500, reply: port.sendPort),
       );
       final raw = await port.first as List<Map<String, Object?>>;
+      if (!mounted || gen != _loadGen) return;
       final scanned = raw.map(RecentFile.fromMap).toList();
       // Geçmişi temizlenenler ("okunmuş") tekrar listelenmez — e-posta
       // okundu/okunmadı mantığı. Yalnızca sonradan eklenen/değişen dosyalar
       // burada kalır.
       final seen = await RecentSeenStore.load();
+      if (!mounted || gen != _loadGen) return;
       final files = scanned
           .where((f) =>
               !seen.contains(RecentSeenStore.keyOf(f.path, f.modified)))
           .toList(growable: false);
-      if (!mounted) return;
+      final keep = preserveSelection
+          ? _selected.intersection({for (final f in files) f.path})
+          : <String>{};
       setState(() {
         _files = files;
-        // Seçim, taze listeyle tutarsız kalmasın diye sıfırlanır.
-        _selected.clear();
+        if (preserveSelection) {
+          _selected
+            ..clear()
+            ..addAll(keep);
+        } else {
+          // Seçim, taze listeyle tutarsız kalmasın diye sıfırlanır.
+          _selected.clear();
+        }
         // `_cleared` bilinçli olarak SIFIRLANMAZ: aşağı kaydırmak taramayı
         // yeniler ama geçmişi geri getirmez; "Tüm geçmişi tekrar göster"
         // düğmesi bu yüzden yenilemeden sonra da ekranda kalır.
       });
     } catch (_) {
-      if (!mounted) return;
+      if (!mounted || gen != _loadGen) return;
       setState(() => _files = const []);
     } finally {
       port.close();
@@ -273,7 +347,7 @@ class _RecentFilesScreenState extends State<RecentFilesScreen>
                     physics: const AlwaysScrollableScrollPhysics(),
                     itemCount: files.length,
                     itemBuilder: (context, index) =>
-                        _row(context, files[index]),
+                        _row(context, files[index], autofocus: index == 0),
                   ),
                 )
               : _emptyState(),
@@ -525,7 +599,7 @@ class _RecentFilesScreenState extends State<RecentFilesScreen>
     );
   }
 
-  Widget _row(BuildContext context, RecentFile f) {
+  Widget _row(BuildContext context, RecentFile f, {bool autofocus = false}) {
     final ext =
         f.name.contains('.') ? f.name.split('.').last.toLowerCase() : '';
     final icon = switch (ext) {
@@ -541,28 +615,34 @@ class _RecentFilesScreenState extends State<RecentFilesScreen>
       _ => Icons.insert_drive_file_rounded,
     };
     final selected = _selected.contains(f.path);
-    return ListTile(
-      selected: selected,
-      selectedTileColor:
-          Theme.of(context).colorScheme.primary.withValues(alpha: 0.08),
-      leading: Icon(icon, size: 32, color: const Color(0xFF00897B)),
-      title: Text(f.name, maxLines: 1, overflow: TextOverflow.ellipsis),
-      subtitle: Text(
-        '(${Formats.date(f.modified)} • ${Formats.size(f.size)})',
-        maxLines: 1,
+    void activate() => _selecting ? _toggleSelect(f) : _open(f);
+    return TvFocusable(
+      autofocus: autofocus,
+      onActivate: activate,
+      scale: 1.02,
+      child: ListTile(
+        selected: selected,
+        selectedTileColor:
+            Theme.of(context).colorScheme.primary.withValues(alpha: 0.08),
+        leading: Icon(icon, size: 32, color: const Color(0xFF00897B)),
+        title: Text(f.name, maxLines: 1, overflow: TextOverflow.ellipsis),
+        subtitle: Text(
+          '(${Formats.date(f.modified)} • ${Formats.size(f.size)})',
+          maxLines: 1,
+        ),
+        trailing: _selecting
+            ? Icon(
+                selected
+                    ? Icons.check_circle_rounded
+                    : Icons.circle_outlined,
+                color: selected
+                    ? Theme.of(context).colorScheme.primary
+                    : Colors.grey,
+              )
+            : null,
+        onTap: activate,
+        onLongPress: () => _toggleSelect(f),
       ),
-      trailing: _selecting
-          ? Icon(
-              selected
-                  ? Icons.check_circle_rounded
-                  : Icons.circle_outlined,
-              color: selected
-                  ? Theme.of(context).colorScheme.primary
-                  : Colors.grey,
-            )
-          : null,
-      onTap: () => _selecting ? _toggleSelect(f) : _open(f),
-      onLongPress: () => _toggleSelect(f),
     );
   }
 

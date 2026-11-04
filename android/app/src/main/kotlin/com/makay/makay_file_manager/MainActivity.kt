@@ -15,11 +15,14 @@ import android.os.Looper
 import android.os.Process
 import android.os.StatFs
 import android.content.Intent
+import android.net.Uri
+import android.provider.OpenableColumns
 import android.provider.Settings
-import io.flutter.embedding.android.FlutterActivity
+import io.flutter.embedding.android.FlutterFragmentActivity
 import io.flutter.embedding.engine.FlutterEngine
 import io.flutter.plugin.common.MethodChannel
 import java.io.ByteArrayOutputStream
+import java.io.File
 import java.util.concurrent.ExecutorService
 import java.util.concurrent.Executors
 
@@ -35,7 +38,9 @@ import java.util.concurrent.Executors
 /// ve ana ekran her açıldığında "yanıt vermiyor (Bekle)" diyaloğuna yol
 /// açıyordu. Artık [_bg] iş parçacığında çalışır; sonuç ana iş parçacığına
 /// `result.success` ile geri verilir.
-class MainActivity : FlutterActivity() {
+///
+/// **Biyometri**: `local_auth` için [FlutterFragmentActivity] gerekir.
+class MainActivity : FlutterFragmentActivity() {
 
     private val channelName = "com.makay.filemanager/platform"
 
@@ -47,6 +52,235 @@ class MainActivity : FlutterActivity() {
 
     /// Medya izni istek kodu.
     private val REQ_MEDIA = 4201
+
+    /// Ana ekran klasör kısayolundan gelen gezinme yolu (tek seferlik).
+    private var launchBrowsePath: String? = null
+
+    /// Sistem "Paylaş" menüsünden gelen dosyalar (tek seferlik; Flutter alır).
+    private var pendingSharedFiles: List<Map<String, Any?>>? = null
+
+    /// Flutter tarafına canlı paylaşım bildirimi için kanal referansı.
+    private var platformChannel: MethodChannel? = null
+
+    override fun onCreate(savedInstanceState: android.os.Bundle?) {
+        super.onCreate(savedInstanceState)
+        captureBrowsePath(intent)
+        captureSharedIntent(intent)
+    }
+
+    override fun onNewIntent(intent: Intent) {
+        super.onNewIntent(intent)
+        setIntent(intent)
+        captureBrowsePath(intent)
+        captureSharedIntent(intent)
+    }
+
+    private fun captureBrowsePath(intent: Intent?) {
+        val path = intent?.getStringExtra(EXTRA_BROWSE_PATH)
+        if (!path.isNullOrBlank()) launchBrowsePath = path
+    }
+
+    /// ACTION_SEND / SEND_MULTIPLE içeriğini önbelleğe kopyalayıp bekletir.
+    private fun captureSharedIntent(intent: Intent?) {
+        if (intent == null) return
+        val action = intent.action ?: return
+        if (action != Intent.ACTION_SEND && action != Intent.ACTION_SEND_MULTIPLE) {
+            return
+        }
+        // Ağır kopyalama ana iş parçacığını kilitlemesin.
+        _bg.execute {
+            val files = resolveSharedFiles(intent)
+            if (files.isEmpty()) return@execute
+            _main.post {
+                // takeSharedFiles temizleyene kadar beklet; dinleyici varsa uyar.
+                pendingSharedFiles = files
+                platformChannel?.invokeMethod("onSharedFiles", files)
+            }
+        }
+    }
+
+    /// Paylaşılan URI / metni uygulama önbelleğine yazar.
+    private fun resolveSharedFiles(intent: Intent): List<Map<String, Any?>> {
+        val out = mutableListOf<Map<String, Any?>>()
+        val dir = File(cacheDir, "shared_inbox").apply {
+            if (!exists()) mkdirs()
+            // Eski kalıntıları temizle (önceki paylaşım oturumu).
+            listFiles()?.forEach { it.delete() }
+        }
+        when (intent.action) {
+            Intent.ACTION_SEND -> {
+                val uri = shareStreamUri(intent)
+                if (uri != null) {
+                    copySharedUri(uri, intent.type, dir)?.let { out.add(it) }
+                } else {
+                    val text = intent.getStringExtra(Intent.EXTRA_TEXT)
+                    if (!text.isNullOrBlank()) {
+                        saveSharedText(text, dir)?.let { out.add(it) }
+                    }
+                }
+            }
+            Intent.ACTION_SEND_MULTIPLE -> {
+                val uris = shareStreamUris(intent)
+                for (uri in uris) {
+                    copySharedUri(uri, intent.type, dir)?.let { out.add(it) }
+                }
+            }
+        }
+        return out
+    }
+
+    @Suppress("DEPRECATION")
+    private fun shareStreamUri(intent: Intent): Uri? {
+        return if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
+            intent.getParcelableExtra(Intent.EXTRA_STREAM, Uri::class.java)
+        } else {
+            intent.getParcelableExtra(Intent.EXTRA_STREAM) as? Uri
+        }
+    }
+
+    @Suppress("DEPRECATION")
+    private fun shareStreamUris(intent: Intent): List<Uri> {
+        val list = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
+            intent.getParcelableArrayListExtra(Intent.EXTRA_STREAM, Uri::class.java)
+        } else {
+            intent.getParcelableArrayListExtra(Intent.EXTRA_STREAM)
+        }
+        return list?.filterNotNull() ?: emptyList()
+    }
+
+    private fun copySharedUri(
+        uri: Uri,
+        fallbackMime: String?,
+        dir: File,
+    ): Map<String, Any?>? {
+        return try {
+            // Paylaşan uygulamanın verdiği okuma iznini kalıcılaştır.
+            try {
+                contentResolver.takePersistableUriPermission(
+                    uri, Intent.FLAG_GRANT_READ_URI_PERMISSION
+                )
+            } catch (_: Exception) {
+                // Geçici grant'ler için normal; yok say.
+            }
+            val displayName = queryDisplayName(uri)
+                ?: "paylasim_${System.currentTimeMillis()}"
+            val safeName = sanitizeFileName(displayName)
+            val dest = uniqueFile(dir, safeName)
+            contentResolver.openInputStream(uri)?.use { input ->
+                dest.outputStream().use { output -> input.copyTo(output) }
+            } ?: return null
+            val mime = contentResolver.getType(uri)
+                ?: fallbackMime
+                ?: mimeFromPath(dest.name)
+                ?: "*/*"
+            mapOf(
+                "path" to dest.absolutePath,
+                "name" to dest.name,
+                "mime" to mime,
+                "size" to dest.length()
+            )
+        } catch (e: Exception) {
+            null
+        }
+    }
+
+    private fun saveSharedText(text: String, dir: File): Map<String, Any?>? {
+        return try {
+            val dest = uniqueFile(dir, "paylasilan_metin.txt")
+            dest.writeText(text)
+            mapOf(
+                "path" to dest.absolutePath,
+                "name" to dest.name,
+                "mime" to "text/plain",
+                "size" to dest.length()
+            )
+        } catch (e: Exception) {
+            null
+        }
+    }
+
+    private fun queryDisplayName(uri: Uri): String? {
+        if (uri.scheme == "file") {
+            return uri.lastPathSegment
+        }
+        return try {
+            contentResolver.query(uri, arrayOf(OpenableColumns.DISPLAY_NAME), null, null, null)
+                ?.use { cursor ->
+                    if (cursor.moveToFirst()) {
+                        val idx = cursor.getColumnIndex(OpenableColumns.DISPLAY_NAME)
+                        if (idx >= 0) cursor.getString(idx) else null
+                    } else null
+                }
+                ?: uri.lastPathSegment
+        } catch (e: Exception) {
+            uri.lastPathSegment
+        }
+    }
+
+    private fun sanitizeFileName(name: String): String {
+        val cleaned = name.replace(Regex("""[\\/:*?"<>|]"""), "_").trim()
+        return cleaned.ifEmpty { "paylasim_${System.currentTimeMillis()}" }
+    }
+
+    private fun uniqueFile(dir: File, name: String): File {
+        var candidate = File(dir, name)
+        if (!candidate.exists()) return candidate
+        val dot = name.lastIndexOf('.')
+        val base = if (dot > 0) name.substring(0, dot) else name
+        val ext = if (dot > 0) name.substring(dot) else ""
+        var i = 1
+        while (candidate.exists()) {
+            candidate = File(dir, "$base ($i)$ext")
+            i++
+        }
+        return candidate
+    }
+
+    /// Klasörü launcher'a sabit kısayol olarak ister.
+    private fun pinFolderShortcut(path: String, label: String): Boolean {
+        val sm = getSystemService(android.content.pm.ShortcutManager::class.java)
+            ?: return false
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O && !sm.isRequestPinShortcutSupported) {
+            return false
+        }
+        val id = "folder_" + path.hashCode().toUInt().toString()
+        val shortcutIntent = Intent(this, MainActivity::class.java).apply {
+            action = Intent.ACTION_VIEW
+            putExtra(EXTRA_BROWSE_PATH, path)
+            flags = Intent.FLAG_ACTIVITY_CLEAR_TOP or Intent.FLAG_ACTIVITY_SINGLE_TOP
+        }
+        val info = android.content.pm.ShortcutInfo.Builder(this, id)
+            .setShortLabel(label.take(24).ifEmpty { "Klasör" })
+            .setLongLabel(label.take(48).ifEmpty { "Klasör" })
+            .setIcon(
+                android.graphics.drawable.Icon.createWithResource(
+                    this, android.R.drawable.ic_menu_agenda
+                )
+            )
+            .setIntent(shortcutIntent)
+            .build()
+        return if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
+            sm.requestPinShortcut(info, null)
+        } else {
+            @Suppress("DEPRECATION")
+            val add = Intent("com.android.launcher.action.INSTALL_SHORTCUT").apply {
+                putExtra(Intent.EXTRA_SHORTCUT_INTENT, shortcutIntent)
+                putExtra(Intent.EXTRA_SHORTCUT_NAME, label.take(24))
+                putExtra(
+                    Intent.EXTRA_SHORTCUT_ICON_RESOURCE,
+                    Intent.ShortcutIconResource.fromContext(
+                        this@MainActivity, android.R.drawable.ic_menu_agenda
+                    )
+                )
+            }
+            sendBroadcast(add)
+            true
+        }
+    }
+
+    companion object {
+        const val EXTRA_BROWSE_PATH = "browse_path"
+    }
 
     /// Ağır kanal çağrısını arka planda çalıştırıp sonucu ana iş parçacığında
     /// teslim eder. Platform kanalı işleyicisi ana iş parçacığında döndüğü için
@@ -89,8 +323,9 @@ class MainActivity : FlutterActivity() {
 
     override fun configureFlutterEngine(flutterEngine: FlutterEngine) {
         super.configureFlutterEngine(flutterEngine)
-        MethodChannel(flutterEngine.dartExecutor.binaryMessenger, channelName)
-            .setMethodCallHandler { call, result ->
+        val channel = MethodChannel(flutterEngine.dartExecutor.binaryMessenger, channelName)
+        platformChannel = channel
+        channel.setMethodCallHandler { call, result ->
                 when (call.method) {
                     "getStorageInfo" -> {
                         try {
@@ -122,16 +357,31 @@ class MainActivity : FlutterActivity() {
                     }
 
                     "openUsageAccessSettings" -> {
-                        // "Kullanım erişimi" yalnız sistem ayar ekranından verilir.
+                        // Önce bu uygulamanın kullanım erişimi detayına derin
+                        // bağlantı; başarısızsa genel liste. Android 13+
+                        // sideload'da anahtar "kısıtlı ayar" ile kilitliyse
+                        // kullanıcı önce uygulama bilgisinden izin açmalı.
                         try {
-                            startActivity(Intent(Settings.ACTION_USAGE_ACCESS_SETTINGS))
+                            val detail = Intent(Settings.ACTION_USAGE_ACCESS_SETTINGS).apply {
+                                data = android.net.Uri.parse("package:$packageName")
+                                addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
+                            }
+                            startActivity(detail)
                             result.success(true)
                         } catch (e: Exception) {
                             try {
-                                startActivity(Intent(Settings.ACTION_SETTINGS))
+                                startActivity(
+                                    Intent(Settings.ACTION_USAGE_ACCESS_SETTINGS)
+                                        .addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
+                                )
                                 result.success(true)
                             } catch (e2: Exception) {
-                                result.error("settings_error", e2.message, null)
+                                try {
+                                    startActivity(Intent(Settings.ACTION_SETTINGS))
+                                    result.success(true)
+                                } catch (e3: Exception) {
+                                    result.error("settings_error", e3.message, null)
+                                }
                             }
                         }
                     }
@@ -217,6 +467,43 @@ class MainActivity : FlutterActivity() {
                             result.success(null)
                         } else {
                             runBackground(result) { videoThumbnailJpeg(path) }
+                        }
+                    }
+
+                    "renderPdfPage" -> {
+                        // Dahili PDF görüntüleyici: PdfRenderer ile sayfa → JPEG.
+                        val path = call.argument<String>("path")
+                        val pageIndex = call.argument<Int>("page") ?: 0
+                        if (path.isNullOrEmpty()) {
+                            result.error("bad_args", "path gerekli", null)
+                        } else {
+                            runBackground(result) { renderPdfPageJpeg(path, pageIndex) }
+                        }
+                    }
+
+                    "listNativeArchive" -> {
+                        val path = call.argument<String>("path")
+                        val password = call.argument<String>("password")
+                        if (path.isNullOrEmpty()) {
+                            result.error("bad_args", "path gerekli", null)
+                        } else {
+                            runBackground(result) {
+                                NativeArchive.listEntries(path, password)
+                            }
+                        }
+                    }
+
+                    "extractNativeArchive" -> {
+                        val path = call.argument<String>("path")
+                        val destDir = call.argument<String>("destDir")
+                        val password = call.argument<String>("password")
+                        val entryName = call.argument<String>("entryName")
+                        if (path.isNullOrEmpty() || destDir.isNullOrEmpty()) {
+                            result.error("bad_args", "path ve destDir gerekli", null)
+                        } else {
+                            runBackground(result) {
+                                NativeArchive.extractAll(path, destDir, password, entryName)
+                            }
                         }
                     }
 
@@ -330,6 +617,73 @@ class MainActivity : FlutterActivity() {
                         }
                     }
 
+                    "openWith" -> {
+                        // Dosya yolu veya content:// URI ile sistem "Farklı aç".
+                        // Medya oynatıcı codec uyumsuzluğunda yedek yol budur.
+                        val path = call.argument<String>("path")
+                        val uriArg = call.argument<String>("uri")
+                        try {
+                            val uri: android.net.Uri
+                            val mime: String
+                            if (!uriArg.isNullOrBlank()) {
+                                uri = android.net.Uri.parse(uriArg)
+                                mime = contentResolver.getType(uri)
+                                    ?: mimeFromPath(uriArg)
+                                    ?: mimeFromPath(path)
+                                    ?: "*/*"
+                            } else {
+                                val file = if (path != null) java.io.File(path) else null
+                                if (file == null || !file.exists() || file.isDirectory) {
+                                    result.error("not_found", "Dosya bulunamadı", null)
+                                    return@setMethodCallHandler
+                                }
+                                uri = androidx.core.content.FileProvider.getUriForFile(
+                                    this, "$packageName.fileprovider", file
+                                )
+                                mime = mimeFromPath(file.name) ?: "*/*"
+                            }
+                            val view = Intent(Intent.ACTION_VIEW).apply {
+                                setDataAndType(uri, mime)
+                                addFlags(Intent.FLAG_GRANT_READ_URI_PERMISSION)
+                                // Chooser hedeflerine URI izninin geçmesi için.
+                                clipData = android.content.ClipData.newRawUri("", uri)
+                            }
+                            startActivity(Intent.createChooser(view, "Farklı aç"))
+                            result.success(true)
+                        } catch (e: Exception) {
+                            result.error("open_error", e.message, null)
+                        }
+                    }
+
+                    "pinShortcut" -> {
+                        // Klasörü ana ekrana sabit kısayol olarak ekle.
+                        val path = call.argument<String>("path")
+                        val label = call.argument<String>("label") ?: "Klasör"
+                        if (path.isNullOrBlank()) {
+                            result.error("bad_args", "Yol gerekli", null)
+                        } else {
+                            try {
+                                result.success(pinFolderShortcut(path, label))
+                            } catch (e: Exception) {
+                                result.error("shortcut_error", e.message, null)
+                            }
+                        }
+                    }
+
+                    "takeLaunchBrowsePath" -> {
+                        // Ana ekran kısayolundan gelen yol (bir kez okunur).
+                        val path = launchBrowsePath
+                        launchBrowsePath = null
+                        result.success(path)
+                    }
+
+                    "takeSharedFiles" -> {
+                        // Sistem paylaşımından gelen dosyalar (bir kez okunur).
+                        val files = pendingSharedFiles
+                        pendingSharedFiles = null
+                        result.success(files)
+                    }
+
                     else -> result.notImplemented()
                 }
             }
@@ -370,6 +724,52 @@ class MainActivity : FlutterActivity() {
         }
     }
 
+    /// PDF sayfasını JPEG olarak döndürür (`pageCount` + `bytes`).
+    ///
+    /// Android `PdfRenderer` kullanır; harici native bağımlılık yoktur
+    /// (Windows birim testleri / CI bozulmaz).
+    private fun renderPdfPageJpeg(path: String, pageIndex: Int): Map<String, Any?>? {
+        return try {
+            val file = java.io.File(path)
+            if (!file.exists()) return null
+            val pfd = android.os.ParcelFileDescriptor.open(
+                file, android.os.ParcelFileDescriptor.MODE_READ_ONLY
+            )
+            // PdfRenderer kapanınca PFD'yi de kapatır.
+            android.graphics.pdf.PdfRenderer(pfd).use { renderer ->
+                val count = renderer.pageCount
+                if (count <= 0) {
+                    return@use mapOf<String, Any?>("pageCount" to 0, "bytes" to null)
+                }
+                val idx = pageIndex.coerceIn(0, count - 1)
+                renderer.openPage(idx).use { page ->
+                    val targetW = 1080
+                    val scale = targetW.toFloat() / page.width.coerceAtLeast(1)
+                    val w = (page.width * scale).toInt().coerceAtLeast(1)
+                    val h = (page.height * scale).toInt().coerceAtLeast(1)
+                    val bitmap = Bitmap.createBitmap(w, h, Bitmap.Config.ARGB_8888)
+                    bitmap.eraseColor(android.graphics.Color.WHITE)
+                    page.render(
+                        bitmap,
+                        null,
+                        null,
+                        android.graphics.pdf.PdfRenderer.Page.RENDER_MODE_FOR_DISPLAY
+                    )
+                    val stream = ByteArrayOutputStream()
+                    bitmap.compress(Bitmap.CompressFormat.JPEG, 85, stream)
+                    bitmap.recycle()
+                    mapOf(
+                        "pageCount" to count,
+                        "page" to idx,
+                        "bytes" to stream.toByteArray()
+                    )
+                }
+            }
+        } catch (e: Exception) {
+            null
+        }
+    }
+
     /// Videonun ilk karesini ~256px JPEG olarak döndürür (önizleme).
     ///
     /// `MediaMetadataRetriever` dosyanın ilk senkron karesini verir; büyük
@@ -403,6 +803,25 @@ class MainActivity : FlutterActivity() {
             } catch (_: Exception) {
             }
         }
+    }
+
+    /// Uzantıdan MIME türü (sistem oynatıcısı / Farklı aç için).
+    private fun mimeFromPath(path: String?): String? {
+        if (path.isNullOrBlank()) return null
+        val name = path.substringAfterLast('/').substringAfterLast('\\')
+        val ext = name.substringAfterLast('.', "").lowercase()
+        if (ext.isEmpty() || ext == name.lowercase()) return null
+        return android.webkit.MimeTypeMap.getSingleton()
+            .getMimeTypeFromExtension(ext)
+            ?: when (ext) {
+                "mkv" -> "video/x-matroska"
+                "ts" -> "video/mp2t"
+                "m4v" -> "video/x-m4v"
+                "flac" -> "audio/flac"
+                "opus" -> "audio/opus"
+                "wma" -> "audio/x-ms-wma"
+                else -> null
+            }
     }
 
     /// Bağlı depolama birimleri (USB OTG / SD kart / dahili).

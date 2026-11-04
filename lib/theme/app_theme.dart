@@ -29,14 +29,16 @@ class AppTheme {
   static ThemeData light({
     Color? dynamicSeed,
     AppAppearance appearance = AppAppearance.klasik,
+    bool tvFocus = false,
   }) =>
-      _base(Brightness.light, dynamicSeed, appearance);
+      _base(Brightness.light, dynamicSeed, appearance, tvFocus: tvFocus);
 
   static ThemeData dark({
     Color? dynamicSeed,
     AppAppearance appearance = AppAppearance.klasik,
+    bool tvFocus = false,
   }) =>
-      _base(Brightness.dark, dynamicSeed, appearance);
+      _base(Brightness.dark, dynamicSeed, appearance, tvFocus: tvFocus);
 
   /// Önizleme/diyaloglar için hazır tema (aydınlık ya da karanlık).
   static ThemeData forAppearance(AppAppearance appearance, Brightness brightness) =>
@@ -53,11 +55,16 @@ class AppTheme {
   static ThemeData _base(
     Brightness brightness,
     Color? dynamicSeed,
-    AppAppearance appearance,
-  ) {
+    AppAppearance appearance, {
+    bool tvFocus = false,
+  }) {
     final scheme = appearance.scheme(brightness, dynamicSeed: dynamicSeed);
     final isDark = brightness == Brightness.dark;
     final radius = BorderRadius.circular(appearance.cornerRadius);
+    // TV: F Dosya tarzı — odak rengi çok daha belirgin; ListTile köşeli.
+    final focusAlpha = tvFocus
+        ? (isDark ? 0.42 : 0.28)
+        : (isDark ? 0.24 : 0.12);
     return ThemeData(
       useMaterial3: true,
       colorScheme: scheme,
@@ -98,17 +105,55 @@ class AppTheme {
       ),
       listTileTheme: ListTileThemeData(
         iconColor: isDark ? Colors.white70 : Colors.black54,
+        selectedTileColor: scheme.primary.withValues(alpha: tvFocus ? 0.20 : 0.08),
+        selectedColor: scheme.primary,
+        shape: RoundedRectangleBorder(
+          borderRadius: BorderRadius.circular(tvFocus ? 12 : 8),
+        ),
+        // TV'de satırlar daha ferah; D-pad hedefi büyür.
+        visualDensity:
+            tvFocus ? VisualDensity.comfortable : VisualDensity.standard,
       ),
       // Odaklanan öğeler belirgin halka alır (TV/D-pad). Renk paletten
       // alınır: görünüm değiştikçe vurgu rengi de ona uyar.
-      focusColor: scheme.primary.withValues(alpha: isDark ? 0.24 : 0.12),
+      focusColor: scheme.primary.withValues(alpha: focusAlpha),
       hoverColor: scheme.primary.withValues(alpha: isDark ? 0.10 : 0.08),
       highlightColor: scheme.primary.withValues(alpha: isDark ? 0.10 : 0.08),
+      // AppBar / araç çubuğu düğmelerinde odak net görünsün.
+      iconButtonTheme: IconButtonThemeData(
+        style: ButtonStyle(
+          overlayColor: WidgetStateProperty.resolveWith((states) {
+            if (states.contains(WidgetState.focused)) {
+              return scheme.primary.withValues(alpha: tvFocus ? 0.36 : 0.16);
+            }
+            return null;
+          }),
+          side: WidgetStateProperty.resolveWith((states) {
+            if (tvFocus && states.contains(WidgetState.focused)) {
+              return BorderSide(color: scheme.primary, width: 2);
+            }
+            return BorderSide.none;
+          }),
+        ),
+      ),
       filledButtonTheme: FilledButtonThemeData(
         style: FilledButton.styleFrom(
           shape: RoundedRectangleBorder(
             borderRadius: BorderRadius.circular(appearance.buttonRadius),
           ),
+        ).copyWith(
+          overlayColor: WidgetStateProperty.resolveWith((states) {
+            if (tvFocus && states.contains(WidgetState.focused)) {
+              return scheme.onPrimary.withValues(alpha: 0.24);
+            }
+            return null;
+          }),
+          side: WidgetStateProperty.resolveWith((states) {
+            if (tvFocus && states.contains(WidgetState.focused)) {
+              return BorderSide(color: scheme.onPrimary, width: 2);
+            }
+            return BorderSide.none;
+          }),
         ),
       ),
       checkboxTheme: CheckboxThemeData(

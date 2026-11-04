@@ -53,6 +53,8 @@ class RecycleBinService {
   List<RecycleItem> _items = [];
   List<RecycleItem> get items => List.unmodifiable(_items);
 
+  bool _loaded = false;
+
   Future<Directory> _binDir() async {
     final base = await getApplicationSupportDirectory();
     final dir =
@@ -71,6 +73,7 @@ class RecycleBinService {
       final file = await _manifest();
       if (!await file.exists()) {
         _items = [];
+        _loaded = true;
         return;
       }
       final data = jsonDecode(await file.readAsString()) as List<dynamic>;
@@ -80,6 +83,12 @@ class RecycleBinService {
     } catch (_) {
       _items = [];
     }
+    _loaded = true;
+  }
+
+  /// Manifest bellekte yoksa diskten okur (tarayıcıdan silmede ezilmesin).
+  Future<void> _ensureLoaded() async {
+    if (!_loaded) await load();
   }
 
   Future<void> _save() async {
@@ -89,7 +98,16 @@ class RecycleBinService {
   }
 
   /// Dosyayı/klasörü geri dönüşüm kutusuna taşır.
+  ///
+  /// Android'de İndirilenler (`/storage/emulated/0/Download`) ile uygulama
+  /// destek dizini farklı birimdedir; düz `rename` EXDEV ile başarısız olur.
+  /// Bu yüzden [FileService.movePath] kullanılır: aynı birimde rename, farklı
+  /// birimde kopyala + kaynak sil.
+  ///
+  /// Taşınamazsa [FileSystemException] fırlatır — çağıran "başarılı" göstermez.
   Future<void> moveToRecycle(FileEntry entry) async {
+    await _ensureLoaded();
+
     // Dizin için [FileEntry.size] bir içerik boyutu DEĞİLDİR: `stat.size`
     // dizinlerde inode boyutudur (0 ya da 4096 B). Kutudaki ve çekmecedeki
     // "Toplam"ın doğru olması için içerik toplamı taşınmadan önce hesaplanır.
@@ -102,21 +120,54 @@ class RecycleBinService {
       }
     }
 
+    final sourceExists = entry.isDirectory
+        ? await Directory(entry.path).exists()
+        : await File(entry.path).exists();
+    if (!sourceExists) {
+      throw FileSystemException('Dosya bulunamadı', entry.path);
+    }
+
     final bin = await _binDir();
     final stamp = DateTime.now().millisecondsSinceEpoch;
     final storedName = '${stamp}__${entry.name}';
-    final source = FileSystemEntity.isDirectorySync(entry.path)
-        ? Directory(entry.path)
-        : File(entry.path);
-    try {
-      if (source is Directory) {
-        await source.rename('${bin.path}${Platform.pathSeparator}$storedName');
-      } else {
-        await source.rename('${bin.path}${Platform.pathSeparator}$storedName');
-      }
-    } on FileSystemException {
-      return; // taşınamadı (izin vb.) — silme yapılmaz.
+    final destPath = '${bin.path}${Platform.pathSeparator}$storedName';
+
+    final result = await const FileService().movePath(
+      entry.path,
+      bin.path,
+      name: storedName,
+    );
+
+    // Kopyalandı ama kaynak silinemedi → kutuda kopya + orijinal duruyor.
+    // Kullanıcıya "taşındı" dememek için kopyayı temizleyip hata veririz.
+    if (result.warning != null && result.warning!.isNotEmpty) {
+      await _deleteQuietly(destPath);
+      throw FileSystemException(
+        'Kutuya taşınamadı (kaynak silinemedi)',
+        entry.path,
+      );
     }
+
+    final stillThere = entry.isDirectory
+        ? await Directory(entry.path).exists()
+        : await File(entry.path).exists();
+    if (stillThere) {
+      await _deleteQuietly(destPath);
+      throw FileSystemException(
+        'Kutuya taşınamadı (kaynak hâlâ mevcut)',
+        entry.path,
+      );
+    }
+
+    final destOk = await File(destPath).exists() ||
+        await Directory(destPath).exists();
+    if (!destOk) {
+      throw FileSystemException(
+        'Kutuya taşınamadı (hedef oluşmadı)',
+        entry.path,
+      );
+    }
+
     _items.insert(
       0,
       RecycleItem(
@@ -132,8 +183,21 @@ class RecycleBinService {
     await CategorySizeService.invalidate();
   }
 
+  Future<void> _deleteQuietly(String path) async {
+    try {
+      final asDir = Directory(path);
+      if (await asDir.exists()) {
+        await asDir.delete(recursive: true);
+        return;
+      }
+      final asFile = File(path);
+      if (await asFile.exists()) await asFile.delete();
+    } catch (_) {}
+  }
+
   /// Kutudan geri yükler: özgün konumuna döner.
   Future<void> restore(RecycleItem item) async {
+    await _ensureLoaded();
     final bin = await _binDir();
     final stored = File('${bin.path}${Platform.pathSeparator}${item.storedName}');
     final storedDir = Directory(stored.path);
@@ -141,29 +205,31 @@ class RecycleBinService {
         ? stored
         : (await storedDir.exists() ? storedDir : null);
     if (source == null) {
-      _items.remove(item);
+      _items.removeWhere((e) => e.storedName == item.storedName);
       await _save();
       return;
     }
     final target = item.originalPath;
-    try {
-      final parent = Directory(target).parent;
-      if (!await parent.exists()) await parent.create(recursive: true);
-      await source.rename(target);
-    } on FileSystemException {
-      // Hedef mevcutsa ad çakışması: özgün ad + " (geri yüklendi)".
-      final dot = target.lastIndexOf(Platform.pathSeparator);
-      final dir = target.substring(0, dot);
-      final name = target.substring(dot + 1);
-      final alt = '$dir${Platform.pathSeparator}geri_$name';
-      await source.rename(alt);
-    }
-    _items.remove(item);
+    final parent = Directory(target).parent;
+    if (!await parent.exists()) await parent.create(recursive: true);
+    var name = target.split(Platform.pathSeparator).last;
+    // Ad çakışmasında üzerine yazmak yerine "geri_" öneki.
+    final clash = await File(target).exists() ||
+        await Directory(target).exists();
+    if (clash) name = 'geri_$name';
+    // İndirilenler ↔ uygulama dizini farklı birim: movePath kopyala+sil yapar.
+    await const FileService().movePath(
+      source.path,
+      parent.path,
+      name: name,
+    );
+    _items.removeWhere((e) => e.storedName == item.storedName);
     await _save();
     await CategorySizeService.invalidate();
   }
 
   Future<void> deletePermanently(RecycleItem item) async {
+    await _ensureLoaded();
     final bin = await _binDir();
     final path = '${bin.path}${Platform.pathSeparator}${item.storedName}';
     final asDir = Directory(path);
@@ -173,12 +239,13 @@ class RecycleBinService {
       final asFile = File(path);
       if (await asFile.exists()) await asFile.delete();
     }
-    _items.remove(item);
+    _items.removeWhere((e) => e.storedName == item.storedName);
     await _save();
     await CategorySizeService.invalidate();
   }
 
   Future<void> empty() async {
+    await _ensureLoaded();
     final bin = await _binDir();
     await for (final entity in bin.list(followLinks: false)) {
       final name = entity.uri.pathSegments.isEmpty

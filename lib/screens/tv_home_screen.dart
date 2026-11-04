@@ -1,4 +1,5 @@
 import 'package:flutter/material.dart';
+import 'package:flutter/services.dart';
 import 'package:provider/provider.dart';
 
 import '../models/home_category.dart';
@@ -129,6 +130,7 @@ class _TvHomeScreenState extends State<TvHomeScreen> {
                     ),
                     itemCount: categories.length,
                     itemBuilder: (context, index) => _TvCategoryCard(
+                      key: ValueKey(categories[index].id),
                       category: categories[index],
                       label: sizes[categories[index].id],
                       autofocus: index == 0,
@@ -191,6 +193,7 @@ class _KeyHint extends StatelessWidget {
 
 class _TvCategoryCard extends StatefulWidget {
   const _TvCategoryCard({
+    super.key,
     required this.category,
     required this.onFocus,
     this.label,
@@ -211,14 +214,33 @@ class _TvCategoryCard extends StatefulWidget {
 class _TvCategoryCardState extends State<_TvCategoryCard> {
   bool _focused = false;
 
+  /// TV kumandasındaki OK / DPAD_CENTER ve klavye Enter/Space.
+  static bool _isActivateKey(LogicalKeyboardKey key) =>
+      key == LogicalKeyboardKey.select ||
+      key == LogicalKeyboardKey.enter ||
+      key == LogicalKeyboardKey.numpadEnter ||
+      key == LogicalKeyboardKey.space ||
+      key == LogicalKeyboardKey.gameButtonA ||
+      key == LogicalKeyboardKey.accept;
+
   @override
   Widget build(BuildContext context) {
     final theme = Theme.of(context);
+    // Ana ekrandaki tüm modül kartları bu widget'ı paylaşır; tek düzeltme
+    // hepsini kapsar. GestureDetector yalnız dokunuşu alır; kumanda OK'si
+    // odaklı Focus düğümüne KeyDownEvent olarak gelir (genelde select).
     return Focus(
       autofocus: widget.autofocus,
       onFocusChange: (focused) {
         setState(() => _focused = focused);
         widget.onFocus(focused);
+      },
+      onKeyEvent: (node, event) {
+        if (event is KeyDownEvent && _isActivateKey(event.logicalKey)) {
+          _open();
+          return KeyEventResult.handled;
+        }
+        return KeyEventResult.ignored;
       },
       child: GestureDetector(
         onTap: _open,

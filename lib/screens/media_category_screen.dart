@@ -2,11 +2,14 @@ import 'package:flutter/foundation.dart';
 import 'package:flutter/material.dart';
 
 import '../services/media_service.dart';
+import '../widgets/app_drawer.dart';
+import '../widgets/tv_focusable.dart';
 import 'album_screen.dart';
 
 /// Kategori ekranı: albüm ızgarası (Görüntüler/Videolar) veya listesi (Ses).
 ///
 /// Referans uygulamadaki "Görüntüler" ve "Videolar" ekranlarının karşılığı.
+/// AppBar: Ara / Sırala / Izgara-Liste / ⋮ (F Dosya Yöneticisi tarzı).
 class MediaCategoryScreen extends StatefulWidget {
   const MediaCategoryScreen({
     super.key,
@@ -21,11 +24,35 @@ class MediaCategoryScreen extends StatefulWidget {
   State<MediaCategoryScreen> createState() => _MediaCategoryScreenState();
 }
 
+enum _AlbumSort {
+  nameAsc('Ada göre (A → Z)'),
+  nameDesc('Ada göre (Z → A)'),
+  countDesc('Adet (Çok → Az)'),
+  countAsc('Adet (Az → Çok)');
+
+  const _AlbumSort(this.label);
+  final String label;
+}
+
 class _MediaCategoryScreenState extends State<MediaCategoryScreen> {
   static const _service = MediaService();
 
+  final _scaffoldKey = GlobalKey<ScaffoldState>();
+  final _searchController = TextEditingController();
+
   List<MediaAlbum>? _albums;
   bool _denied = false;
+  bool _searchActive = false;
+  String _query = '';
+  _AlbumSort _sort = _AlbumSort.nameAsc;
+  /// Görüntü/video varsayılanı ızgara; ses her zaman liste.
+  late bool _grid = widget.categoryId != 'audio';
+
+  @override
+  void dispose() {
+    _searchController.dispose();
+    super.dispose();
+  }
 
   @override
   void initState() {
@@ -49,11 +76,120 @@ class _MediaCategoryScreenState extends State<MediaCategoryScreen> {
     setState(() => _albums = albums);
   }
 
+  List<MediaAlbum> get _visible {
+    var list = List<MediaAlbum>.of(_albums ?? const []);
+    final q = _query.trim().toLowerCase();
+    if (q.isNotEmpty) {
+      list = list.where((a) => a.name.toLowerCase().contains(q)).toList();
+    }
+    switch (_sort) {
+      case _AlbumSort.nameAsc:
+        list.sort((a, b) => a.name.toLowerCase().compareTo(b.name.toLowerCase()));
+      case _AlbumSort.nameDesc:
+        list.sort((a, b) => b.name.toLowerCase().compareTo(a.name.toLowerCase()));
+      case _AlbumSort.countDesc:
+        list.sort((a, b) => b.count.compareTo(a.count));
+      case _AlbumSort.countAsc:
+        list.sort((a, b) => a.count.compareTo(b.count));
+    }
+    return list;
+  }
+
+  void _pickSort() {
+    showModalBottomSheet<void>(
+      context: context,
+      builder: (context) => SafeArea(
+        child: Column(
+          mainAxisSize: MainAxisSize.min,
+          children: [
+            for (final mode in _AlbumSort.values)
+              ListTile(
+                title: Text(mode.label),
+                trailing: _sort == mode
+                    ? Icon(Icons.check_rounded,
+                        color: Theme.of(context).colorScheme.primary)
+                    : null,
+                onTap: () {
+                  Navigator.pop(context);
+                  setState(() => _sort = mode);
+                },
+              ),
+          ],
+        ),
+      ),
+    );
+  }
+
   @override
   Widget build(BuildContext context) {
     final albums = _albums;
     return Scaffold(
-      appBar: AppBar(title: Text(widget.title)),
+      key: _scaffoldKey,
+      drawer: const AppDrawer(),
+      appBar: AppBar(
+        leading: IconButton(
+          icon: const Icon(Icons.menu_rounded),
+          tooltip: 'Menü',
+          onPressed: () => _scaffoldKey.currentState?.openDrawer(),
+        ),
+        title: _searchActive
+            ? TextField(
+                controller: _searchController,
+                autofocus: true,
+                decoration: const InputDecoration(
+                  hintText: 'Albüm ara…',
+                  border: InputBorder.none,
+                ),
+                onChanged: (v) => setState(() => _query = v),
+              )
+            : Text(widget.title),
+        actions: [
+          IconButton(
+            icon: Icon(_searchActive ? Icons.close_rounded : Icons.search),
+            tooltip: _searchActive ? 'Aramayı kapat' : 'Ara',
+            onPressed: () {
+              setState(() {
+                _searchActive = !_searchActive;
+                if (!_searchActive) {
+                  _searchController.clear();
+                  _query = '';
+                }
+              });
+            },
+          ),
+          IconButton(
+            icon: const Icon(Icons.sort_rounded),
+            tooltip: 'Sırala',
+            onPressed: _pickSort,
+          ),
+          if (widget.categoryId != 'audio')
+            IconButton(
+              icon: Icon(
+                _grid ? Icons.view_list_rounded : Icons.grid_view_rounded,
+              ),
+              tooltip: _grid ? 'Liste görünümü' : 'Izgara görünümü',
+              onPressed: () => setState(() => _grid = !_grid),
+            ),
+          PopupMenuButton<String>(
+            tooltip: 'Diğer',
+            onSelected: (value) {
+              switch (value) {
+                case 'refresh':
+                  _load(fresh: true);
+                case 'settings':
+                  Navigator.of(context).pushNamed('/settings');
+                case 'home':
+                  Navigator.of(context).popUntil((r) => r.isFirst);
+              }
+            },
+            itemBuilder: (context) => const [
+              PopupMenuItem(value: 'refresh', child: Text('Yenile')),
+              PopupMenuItem(value: 'settings', child: Text('Ayarlar')),
+              PopupMenuItem(value: 'home', child: Text('Ana ekran')),
+            ],
+          ),
+        ],
+      ),
       body: _denied
           ? _PermissionBody(onRetry: () {
               setState(() => _denied = false);
@@ -66,30 +202,42 @@ class _MediaCategoryScreenState extends State<MediaCategoryScreen> {
                   : RefreshIndicator(
                       // Aşağı kaydırma: önbelleklerle birlikte tam yenileme.
                       onRefresh: () => _load(fresh: true),
-                      child: widget.categoryId == 'audio'
-                          ? _audioList()
-                          : _albumGrid(),
+                      child: _visible.isEmpty
+                          ? ListView(
+                              children: const [
+                                SizedBox(height: 120),
+                                Center(child: Text('Eşleşen albüm yok')),
+                              ],
+                            )
+                          : _grid
+                              ? _albumGrid()
+                              : _audioList(),
                     ),
     );
   }
 
-  /// Ses: liste görünümü (küçük resim + ad + adet) — referans "Ses" ekranı.
+  /// Liste görünümü (ses varsayılanı; görüntü/videoda da kullanılabilir).
   Widget _audioList() {
-    final albums = _albums ?? const <MediaAlbum>[];
+    final albums = _visible;
     return ListView.builder(
       itemCount: albums.length,
       itemBuilder: (context, index) {
         final album = albums[index];
-        return ListTile(
-          leading: _AlbumThumb(
-            album: album,
-            categoryId: widget.categoryId,
-            size: 56,
-            rounded: 4,
+        return TvFocusable(
+          autofocus: index == 0,
+          onActivate: () => _openAlbum(album),
+          scale: 1.02,
+          child: ListTile(
+            leading: _AlbumThumb(
+              album: album,
+              categoryId: widget.categoryId,
+              size: 56,
+              rounded: 4,
+            ),
+            title: Text(album.name),
+            trailing: Text('(${album.count})'),
+            onTap: () => _openAlbum(album),
           ),
-          title: Text(album.name),
-          trailing: Text('(${album.count})'),
-          onTap: () => _openAlbum(album),
         );
       },
     );
@@ -97,7 +245,7 @@ class _MediaCategoryScreenState extends State<MediaCategoryScreen> {
 
   /// Görüntüler/Videolar: kare ızgara — referans "Görüntüler" ekranı.
   Widget _albumGrid() {
-    final albums = _albums ?? const <MediaAlbum>[];
+    final albums = _visible;
     return GridView.builder(
       padding: const EdgeInsets.all(8),
       gridDelegate: const SliverGridDelegateWithFixedCrossAxisCount(
@@ -109,41 +257,46 @@ class _MediaCategoryScreenState extends State<MediaCategoryScreen> {
       itemCount: albums.length,
       itemBuilder: (context, index) {
         final album = albums[index];
-        return InkWell(
-          borderRadius: BorderRadius.circular(8),
-          onTap: () => _openAlbum(album),
-          child: Column(
-            crossAxisAlignment: CrossAxisAlignment.stretch,
-            children: [
-              Expanded(
-                child: ClipRRect(
-                  borderRadius: BorderRadius.circular(8),
-                  child: Stack(
-                    fit: StackFit.expand,
-                    children: [
-                      _AlbumThumb(
-                        album: album,
-                        categoryId: widget.categoryId,
-                        size: 300,
-                      ),
-                      if (widget.categoryId == 'videos')
-                        const Center(
-                          child: Icon(Icons.play_circle_fill_rounded,
-                              color: Colors.white70, size: 42),
+        return TvFocusable(
+          autofocus: index == 0,
+          onActivate: () => _openAlbum(album),
+          borderRadius: 8,
+          child: InkWell(
+            borderRadius: BorderRadius.circular(8),
+            onTap: () => _openAlbum(album),
+            child: Column(
+              crossAxisAlignment: CrossAxisAlignment.stretch,
+              children: [
+                Expanded(
+                  child: ClipRRect(
+                    borderRadius: BorderRadius.circular(8),
+                    child: Stack(
+                      fit: StackFit.expand,
+                      children: [
+                        _AlbumThumb(
+                          album: album,
+                          categoryId: widget.categoryId,
+                          size: 300,
                         ),
-                    ],
+                        if (widget.categoryId == 'videos')
+                          const Center(
+                            child: Icon(Icons.play_circle_fill_rounded,
+                                color: Colors.white70, size: 42),
+                          ),
+                      ],
+                    ),
                   ),
                 ),
-              ),
-              const SizedBox(height: 6),
-              Text(
-                '${album.name} (${album.count})',
-                textAlign: TextAlign.center,
-                maxLines: 1,
-                overflow: TextOverflow.ellipsis,
-                style: Theme.of(context).textTheme.bodyMedium,
-              ),
-            ],
+                const SizedBox(height: 6),
+                Text(
+                  '${album.name} (${album.count})',
+                  textAlign: TextAlign.center,
+                  maxLines: 1,
+                  overflow: TextOverflow.ellipsis,
+                  style: Theme.of(context).textTheme.bodyMedium,
+                ),
+              ],
+            ),
           ),
         );
       },
@@ -195,12 +348,17 @@ class _AlbumThumb extends StatelessWidget {
             child: Image.memory(data, fit: BoxFit.cover),
           );
         }
+        final fallback = switch (categoryId) {
+          'videos' => Icons.videocam_rounded,
+          'audio' => Icons.audiotrack_rounded,
+          _ => Icons.photo_rounded,
+        };
         return Container(
           decoration: BoxDecoration(
             color: Theme.of(context).colorScheme.surfaceContainerHighest,
             borderRadius: BorderRadius.circular(rounded),
           ),
-          child: const Icon(Icons.photo_rounded, size: 28),
+          child: Icon(fallback, size: 28),
         );
       },
     );

@@ -1,6 +1,10 @@
 import 'dart:io';
 
 import 'package:archive/archive_io.dart';
+import 'package:flutter/services.dart';
+
+import 'platform_service.dart';
+import 'transfer.dart';
 
 /// Arşiv işleminde güvenlik ihlali: girdi yolu hedef klasörün dışına
 /// çıkıyor (Zip-Slip / yol takibi saldırısı). Arşiv güvenilmez kaynaktan
@@ -80,19 +84,35 @@ class ArchiveService {
   const ArchiveService();
 
   /// Okunabilen (listelenebilir/çıkarılabilen) uzantılar.
+  ///
+  /// `.rar` / `.7z` Android'de native katmanla açılır.
   static const List<String> supportedExtensions = <String>[
     '.zip',
     '.tar',
     '.gz',
     '.tgz',
     '.tar.gz',
+    '.rar',
+    '.7z',
   ];
 
   /// Oluşturulabilen arşiv türleri.
   static const List<String> creatableExtensions = <String>['.zip', '.tar'];
 
-  /// [path] bir arşiv dosyası mı? (uzantıya göre)
-  static bool isArchive(String path) => _formatOf(path) != null;
+  /// Tanınan ama henüz açılamayan biçimler (dürüst hata mesajı için).
+  static const List<String> unsupportedKnownExtensions = <String>[
+    '.iso',
+    '.obb',
+  ];
+
+  /// [path] bir arşiv dosyası mı? (uzantıya göre; split .001 dahil)
+  static bool isArchive(String path) {
+    if (_formatOf(path) != null) return true;
+    final lower = path.toLowerCase();
+    if (RegExp(r'\.(zip\.)?\d{3}$').hasMatch(lower)) return true;
+    if (lower.endsWith('.z01')) return true;
+    return unsupportedKnownExtensions.any(lower.endsWith);
+  }
 
   /// Kullanıcıya gösterilecek format adı (örn. 'ZIP'); bilinmiyorsa null.
   static String? formatName(String path) => switch (_formatOf(path)) {
@@ -100,17 +120,35 @@ class ArchiveService {
         'tar' => 'TAR',
         'targz' => 'TAR.GZ',
         'gz' => 'GZIP',
+        'rar' => 'RAR',
+        '7z' => '7Z',
+        'iso' => 'ISO',
+        'obb' => 'OBB',
+        'split' => 'Bölünmüş arşiv',
         _ => null,
       };
 
-  /// Uzantıdan iç format anahtarına: zip | tar | targz | gz; desteklenmiyorsa null.
+  /// Uzantıdan iç format anahtarına.
   static String? _formatOf(String path) {
     final lower = path.toLowerCase();
     if (lower.endsWith('.tar.gz') || lower.endsWith('.tgz')) return 'targz';
     if (lower.endsWith('.zip')) return 'zip';
     if (lower.endsWith('.tar')) return 'tar';
     if (lower.endsWith('.gz')) return 'gz';
+    if (lower.endsWith('.rar')) return 'rar';
+    if (lower.endsWith('.7z')) return '7z';
+    if (lower.endsWith('.iso')) return 'iso';
+    if (lower.endsWith('.obb')) return 'obb';
+    if (lower.endsWith('.z01') || RegExp(r'\.(zip\.)?\d{3}$').hasMatch(lower)) {
+      return 'split';
+    }
     return null;
+  }
+
+  /// Şifre gerektiğinde fırlatılır; arayüz PIN ister.
+  static bool isPasswordError(Object err) {
+    final m = err.toString().toLowerCase();
+    return m.contains('password') || m.contains('şifre') || m.contains('sifre');
   }
 
   /// Verilen aday için benzersiz bir zip dosya yolu önerir
@@ -162,15 +200,25 @@ class ArchiveService {
 
   /// Arşivin içeriğini listeler. Eksik olan üst klasörler ağaç tamamlansın
   /// diye sentezlenir ([ArchiveEntryInfo.isVirtual] true).
-  Future<List<ArchiveEntryInfo>> listEntries(String archivePath) async {
-    final format = await _prepareFormat(archivePath);
+  ///
+  /// [password] şifreli ZIP için; split parçalar otomatik birleştirilir.
+  Future<List<ArchiveEntryInfo>> listEntries(
+    String archivePath, {
+    String? password,
+  }) async {
+    final resolved = await materializeSplitIfNeeded(archivePath);
+    final format = await _prepareFormat(resolved);
+
+    if (format == 'rar' || format == '7z') {
+      return _listNative(resolved, password: password);
+    }
 
     if (format == 'gz') {
       // Tek dosyalık gzip: içinde tek bir girdi var.
-      final file = File(archivePath);
+      final file = File(resolved);
       return <ArchiveEntryInfo>[
         ArchiveEntryInfo(
-          name: _gzInnerName(archivePath),
+          name: _gzInnerName(resolved),
           isDirectory: false,
           uncompressedSize: _gzUncompressedSize(file),
           compressedSize: await file.length(),
@@ -179,9 +227,9 @@ class ArchiveService {
       ];
     }
 
-    final input = InputFileStream(archivePath);
+    final input = InputFileStream(resolved);
     try {
-      final archive = _decode(format, input);
+      final archive = _decode(format, input, password: password);
       final entries = <ArchiveEntryInfo>[];
       for (final entry in archive) {
         final name = _stripTrailingSlash(entry.name);
@@ -201,6 +249,76 @@ class ArchiveService {
     }
   }
 
+  /// Bölünmüş arşiv parçalarını (`.001` / `.z01`) tek geçici dosyada birleştirir.
+  ///
+  /// Birleştirme gerekmezse orijinal yolu döner.
+  static Future<String> materializeSplitIfNeeded(String archivePath) async {
+    final lower = archivePath.toLowerCase();
+    final file = File(archivePath);
+    if (!await file.exists()) return archivePath;
+
+    Future<String> joinParts(List<File> parts) async {
+      if (parts.length <= 1) return archivePath;
+      final out = File(
+        '${Directory.systemTemp.path}${Platform.pathSeparator}'
+        'makay_split_${DateTime.now().millisecondsSinceEpoch}.zip',
+      );
+      final sink = out.openWrite();
+      try {
+        for (final p in parts) {
+          await sink.addStream(p.openRead());
+        }
+      } finally {
+        await sink.close();
+      }
+      return out.path;
+    }
+
+    // name.zip.001 veya name.001
+    final mZipDot = RegExp(r'^(.*)\.zip\.001$', caseSensitive: false)
+        .firstMatch(archivePath);
+    final mPlain = RegExp(r'^(.*)\.001$', caseSensitive: false)
+        .firstMatch(archivePath);
+    if (mZipDot != null || (mPlain != null && !lower.endsWith('.zip.001'))) {
+      final stem = mZipDot?.group(1) ?? mPlain!.group(1)!;
+      final useZipInfix = mZipDot != null;
+      final parts = <File>[file];
+      for (var i = 2; i < 1000; i++) {
+        final n = i.toString().padLeft(3, '0');
+        final candidate = File(
+          useZipInfix ? '$stem.zip.$n' : '$stem.$n',
+        );
+        if (!await candidate.exists()) break;
+        parts.add(candidate);
+      }
+      return joinParts(parts);
+    }
+
+    if (lower.endsWith('.z01')) {
+      // WinZip: name.zip + name.z01 + name.z02 …
+      final base = archivePath.substring(0, archivePath.length - 3); // drop 01
+      // base ends with `.z`
+      final nameBase = base.substring(0, base.length - 2); // drop `.z`
+      final parts = <File>[];
+      final zipMain = File('$nameBase.zip');
+      if (await zipMain.exists()) parts.add(zipMain);
+      parts.add(file);
+      for (var i = 2; i < 1000; i++) {
+        final p = File('$nameBase.z${i.toString().padLeft(2, '0')}');
+        if (!await p.exists()) break;
+        parts.add(p);
+      }
+      if (parts.length <= 1) {
+        throw ArchiveServiceException(
+          'Bölünmüş ZIP (.z01) için ana .zip veya diğer parçalar bulunamadı.',
+        );
+      }
+      return joinParts(parts);
+    }
+
+    return archivePath;
+  }
+
   /// Arşivdeki tüm girdileri [destDir] altına çıkarır.
   ///
   /// [onProgress] her girdiden sonra çağrılır. [totalEntries] biliniyorsa
@@ -216,68 +334,106 @@ class ArchiveService {
     required String destDir,
     ArchiveProgress? onProgress,
     int? totalEntries,
+    CancelToken? cancelToken,
+    String? password,
   }) async {
-    final format = await _prepareFormat(archivePath);
+    final resolved = await materializeSplitIfNeeded(archivePath);
+    final format = await _prepareFormat(resolved);
     await Directory(destDir).create(recursive: true);
 
-    if (format == 'gz') {
-      final target = safeTargetPath(destDir, _gzInnerName(archivePath));
-      await Directory(_parentOf(target)).create(recursive: true);
-      final input = InputFileStream(archivePath);
-      final output = OutputFileStream(target);
+    void checkCancel() {
+      if (cancelToken?.isCancelled == true) {
+        throw const TransferCancelled();
+      }
+    }
+
+    Future<void> cleanupPartial() async {
       try {
-        final ok = GZipDecoder().decodeStream(input, output, verify: true);
-        if (!ok) {
-          throw ArchiveServiceException(
-              'Arşiv çıkarılamadı; dosya bozuk olabilir: $archivePath');
+        final dir = Directory(destDir);
+        if (await dir.exists()) {
+          await dir.delete(recursive: true);
+        }
+      } catch (_) {}
+    }
+
+    try {
+      if (format == 'rar' || format == '7z') {
+        checkCancel();
+        final n = await _extractNative(
+          resolved,
+          destDir,
+          password: password,
+        );
+        onProgress?.call(n, totalEntries ?? n);
+        return n;
+      }
+
+      if (format == 'gz') {
+        checkCancel();
+        final target = safeTargetPath(destDir, _gzInnerName(resolved));
+        await Directory(_parentOf(target)).create(recursive: true);
+        final input = InputFileStream(resolved);
+        final output = OutputFileStream(target);
+        try {
+          final ok = GZipDecoder().decodeStream(input, output, verify: true);
+          if (!ok) {
+            throw ArchiveServiceException(
+                'Arşiv çıkarılamadı; dosya bozuk olabilir: $resolved');
+          }
+        } finally {
+          await input.close();
+          await output.close();
+        }
+        checkCancel();
+        onProgress?.call(1, 1);
+        return 1;
+      }
+
+      final input = InputFileStream(resolved);
+      var written = 0;
+      var done = 0;
+      try {
+        if (format == 'zip') {
+          final archive = _decode('zip', input, password: password);
+          final total = totalEntries ?? archive.length;
+          try {
+            for (final entry in archive) {
+              checkCancel();
+              if (_writeEntry(entry, destDir)) written++;
+              done++;
+              onProgress?.call(done, total);
+            }
+          } finally {
+            await archive.clear();
+          }
+        } else {
+          // tar / tar.gz: tek geçiş; içerik yalnızca girdiye ulaşıldığında
+          // elde bulunur, bu yüzden yazma geri çağrıcı içinde yapılır.
+          final tarInput =
+              format == 'targz' ? GZipDecoder().decodeLazy(input) : input;
+          final total = totalEntries ?? -1;
+          try {
+            TarDecoder().decodeStream(tarInput,
+                verify: true, keepEntries: false, callback: (entry) {
+              checkCancel();
+              if (_writeEntry(entry, destDir)) written++;
+              done++;
+              onProgress?.call(done, total);
+            });
+          } on ArchiveException catch (err) {
+            _corrupt(err);
+          } on FormatException catch (err) {
+            _corrupt(err);
+          }
         }
       } finally {
         await input.close();
-        await output.close();
       }
-      onProgress?.call(1, 1);
-      return 1;
+      return written;
+    } on TransferCancelled {
+      await cleanupPartial();
+      rethrow;
     }
-
-    final input = InputFileStream(archivePath);
-    var written = 0;
-    var done = 0;
-    try {
-      if (format == 'zip') {
-        final archive = _decode('zip', input);
-        final total = totalEntries ?? archive.length;
-        try {
-          for (final entry in archive) {
-            if (_writeEntry(entry, destDir)) written++;
-            done++;
-            onProgress?.call(done, total);
-          }
-        } finally {
-          await archive.clear();
-        }
-      } else {
-        // tar / tar.gz: tek geçiş; içerik yalnızca girdiye ulaşıldığında
-        // elde bulunur, bu yüzden yazma geri çağrıcı içinde yapılır.
-        final tarInput =
-            format == 'targz' ? GZipDecoder().decodeLazy(input) : input;
-        final total = totalEntries ?? -1;
-        try {
-          TarDecoder().decodeStream(tarInput,
-              verify: true, keepEntries: false, callback: (entry) {
-            if (_writeEntry(entry, destDir)) written++;
-            done++;
-            onProgress?.call(done, total);
-          });
-        } on ArchiveException catch (err) {
-          _corrupt(err);
-        } on FormatException catch (err) {
-          _corrupt(err);
-        }
-      }
-    } finally {
-      await input.close();
-    }
-    return written;
   }
 
   /// [entryName] girdisini (dosya ya da klasör alt ağacı) tek başına
@@ -286,29 +442,41 @@ class ArchiveService {
     required String archivePath,
     required String entryName,
     required String destDir,
+    String? password,
   }) async {
-    final format = await _prepareFormat(archivePath);
+    final resolved = await materializeSplitIfNeeded(archivePath);
+    final format = await _prepareFormat(resolved);
     final wanted = _stripTrailingSlash(entryName.replaceAll('\\', '/'));
     if (wanted.isEmpty) {
       throw ArchiveServiceException('Geçersiz arşiv girdi adı.');
     }
     await Directory(destDir).create(recursive: true);
 
+    if (format == 'rar' || format == '7z') {
+      await _extractNative(
+        resolved,
+        destDir,
+        password: password,
+        entryName: wanted,
+      );
+      return;
+    }
+
     if (format == 'gz') {
-      final inner = _gzInnerName(archivePath);
+      final inner = _gzInnerName(resolved);
       if (inner != wanted) {
         throw ArchiveServiceException(
             'Arşivde "$wanted" adında bir girdi bulunamadı.');
       }
-      await _extractGz(archivePath, destDir);
+      await _extractGz(resolved, destDir);
       return;
     }
 
-    final input = InputFileStream(archivePath);
+    final input = InputFileStream(resolved);
     var found = false;
     try {
       if (format == 'zip') {
-        final archive = _decode('zip', input);
+        final archive = _decode('zip', input, password: password);
         try {
           for (final entry in archive) {
             final name = _stripTrailingSlash(entry.name);
@@ -478,10 +646,76 @@ class ArchiveService {
     final format = _formatOf(archivePath);
     if (format == null) {
       throw ArchiveServiceException(
-          'Desteklenmeyen arşiv biçimi. Desteklenenler: ZIP, TAR, GZ, TGZ, '
-          'TAR.GZ (RAR ve 7z desteklenmez).');
+          'Desteklenmeyen arşiv biçimi. Desteklenenler: ZIP (şifreli dahil), '
+          'RAR, 7Z, TAR, GZ, TGZ, TAR.GZ ve bölünmüş ZIP (.001 / .z01).');
+    }
+    if (format == 'iso' || format == 'obb') {
+      throw ArchiveServiceException(
+        '${formatName(archivePath)} biçimi bu sürümde açılamaz.',
+      );
+    }
+    if (format == 'split') {
+      throw ArchiveServiceException(
+        'Bölünmüş arşiv birleştirilemedi. İlk parçayı (.001 / .z01) seçin.',
+      );
     }
     return format;
+  }
+
+  Future<List<ArchiveEntryInfo>> _listNative(
+    String path, {
+    String? password,
+  }) async {
+    try {
+      final raw = await PlatformService.listNativeArchive(
+        path: path,
+        password: password,
+      );
+      final entries = <ArchiveEntryInfo>[
+        for (final m in raw)
+          ArchiveEntryInfo(
+            name: _stripTrailingSlash('${m['name'] ?? ''}'),
+            isDirectory: m['isDirectory'] == true,
+            uncompressedSize: (m['uncompressedSize'] as num?)?.toInt() ?? 0,
+            compressedSize: (m['compressedSize'] as num?)?.toInt() ?? 0,
+            modificationTime: null,
+          ),
+      ].where((e) => e.name.isNotEmpty).toList();
+      return _withVirtualFolders(entries);
+    } on UnsupportedError catch (e) {
+      throw ArchiveServiceException('$e');
+    } on PlatformException catch (e) {
+      final msg = e.message ?? '';
+      if (ArchiveService.isPasswordError(msg) ||
+          msg.toLowerCase().contains('password')) {
+        throw ArchiveServiceException('Şifre gerekli veya hatalı');
+      }
+      throw ArchiveServiceException(
+        'Arşiv açılamadı: ${msg.isEmpty ? e.code : msg}',
+      );
+    }
+  }
+
+  Future<int> _extractNative(
+    String path,
+    String destDir, {
+    String? password,
+    String? entryName,
+  }) async {
+    try {
+      return await PlatformService.extractNativeArchive(
+        path: path,
+        destDir: destDir,
+        password: password,
+        entryName: entryName,
+      );
+    } on UnsupportedError catch (e) {
+      throw ArchiveServiceException('$e');
+    } on PlatformException catch (e) {
+      throw ArchiveServiceException(
+        'Çıkarılamadı: ${e.message ?? e.code}',
+      );
+    }
   }
 
   /// ZIP dosyasının sonunda EOCD imzası (PK\\x05\\x06) aranır; bulunamazsa
@@ -512,7 +746,11 @@ class ArchiveService {
     }
   }
 
-  Archive _decode(String format, InputFileStream input) {
+  Archive _decode(
+    String format,
+    InputFileStream input, {
+    String? password,
+  }) {
     // Arşiv akışını çözer; bozuk/okunamayan girdilerde Türkçe hata fırlatır.
     //
     // Not: tar türlerinde içerik her zaman saklanır; `storeData: false`
@@ -521,7 +759,7 @@ class ArchiveService {
     try {
       switch (format) {
         case 'zip':
-          return ZipDecoder().decodeStream(input);
+          return ZipDecoder().decodeStream(input, password: password);
         case 'tar':
           return TarDecoder().decodeStream(input, verify: true);
         case 'targz':

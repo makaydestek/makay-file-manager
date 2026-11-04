@@ -59,6 +59,11 @@ android {
             } else {
                 signingConfigs.getByName("debug")
             }
+            // RAR/7Z bağımlılıklarının R8 "missing class" hatasını önlemek için.
+            proguardFiles(
+                getDefaultProguardFile("proguard-android-optimize.txt"),
+                "proguard-rules.pro",
+            )
         }
     }
 }
@@ -133,4 +138,15 @@ tasks.configureEach {
 
 flutter {
     source = "../.."
+}
+
+dependencies {
+    // RAR açma (RAR4; RAR5 sınırlı). Yalnızca çıkarma — UnRAR lisansı.
+    implementation("com.github.junrar:junrar:7.5.5")
+    // 7Z açma / listeleme / çıkarma.
+    implementation("org.apache.commons:commons-compress:1.26.2")
+    implementation("org.tukaani:xz:1.10")
+    // junrar slf4j ister; R8 release'te StaticLoggerBinder eksik diye düşer.
+    // nop: log üretmez, yalnızca bağlayıcıyı sağlar.
+    implementation("org.slf4j:slf4j-nop:1.7.36")
 }

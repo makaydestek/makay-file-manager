@@ -3,9 +3,12 @@ import 'package:provider/provider.dart';
 
 import '../models/home_category.dart';
 import '../providers/settings_provider.dart';
+import '../services/bookmark_service.dart';
 import '../services/category_size_service.dart';
+import '../services/platform_service.dart';
 import '../theme/app_theme.dart';
 import '../widgets/app_drawer.dart';
+import 'browser_screen.dart';
 import 'home_categories_screen.dart';
 
 /// Uygulama ana ekranı: referans uygulamadaki kategori ızgarası.
@@ -25,6 +28,22 @@ class _HomeScreenState extends State<HomeScreen> {
     super.initState();
     // Kategori boyutları arka planda hesaplanır; önbellek varsa anında görünür.
     CategorySizeService.refresh();
+    BookmarkStore.load();
+    // Ana ekran klasör kısayolundan gelen yol.
+    WidgetsBinding.instance.addPostFrameCallback((_) => _openLaunchPath());
+  }
+
+  Future<void> _openLaunchPath() async {
+    final path = await PlatformService.takeLaunchBrowsePath();
+    if (!mounted || path == null || path.isEmpty) return;
+    final parts =
+        path.split(RegExp(r'[/\\]')).where((p) => p.isNotEmpty).toList();
+    final name = parts.isEmpty ? path : parts.last;
+    await Navigator.of(context).push(
+      MaterialPageRoute(
+        builder: (_) => BrowserScreen(title: name, rootPath: path),
+      ),
+    );
   }
 
   Future<void> _refresh({bool force = false}) =>
@@ -132,23 +151,101 @@ class _HomeScreenState extends State<HomeScreen> {
                 final columns = _columnsFor(viewStyle, constraints);
                 return RefreshIndicator(
                   onRefresh: () => _refresh(force: true),
-                  child: ValueListenableBuilder<Map<String, String>>(
-                    valueListenable: CategorySizeService.labels,
-                    builder: (context, sizes, _) => GridView.builder(
-                      physics: const AlwaysScrollableScrollPhysics(),
-                      padding: const EdgeInsets.all(12),
-                      gridDelegate: SliverGridDelegateWithFixedCrossAxisCount(
-                        crossAxisCount: columns,
-                        mainAxisSpacing: 8,
-                        crossAxisSpacing: 8,
-                        childAspectRatio: 0.88,
+                  child: CustomScrollView(
+                    physics: const AlwaysScrollableScrollPhysics(),
+                    slivers: [
+                      ValueListenableBuilder<List<Bookmark>>(
+                        valueListenable: BookmarkStore.list,
+                        builder: (context, bookmarks, _) {
+                          if (bookmarks.isEmpty) {
+                            return const SliverToBoxAdapter(
+                                child: SizedBox.shrink());
+                          }
+                          return SliverToBoxAdapter(
+                            child: Padding(
+                              padding: const EdgeInsets.fromLTRB(12, 12, 12, 0),
+                              child: Column(
+                                crossAxisAlignment: CrossAxisAlignment.start,
+                                children: [
+                                  Text(
+                                    'Yer imleri',
+                                    style: Theme.of(context)
+                                        .textTheme
+                                        .titleSmall
+                                        ?.copyWith(
+                                          fontWeight: FontWeight.bold,
+                                          color: Theme.of(context)
+                                              .colorScheme
+                                              .primary,
+                                        ),
+                                  ),
+                                  const SizedBox(height: 8),
+                                  SizedBox(
+                                    height: 40,
+                                    child: ReorderableListView.builder(
+                                      scrollDirection: Axis.horizontal,
+                                      buildDefaultDragHandles: false,
+                                      onReorderItem: BookmarkStore.reorder,
+                                      itemCount: bookmarks.length,
+                                      itemBuilder: (context, index) {
+                                        final b = bookmarks[index];
+                                        return Padding(
+                                          key: ValueKey(b.path),
+                                          padding:
+                                              const EdgeInsets.only(right: 8),
+                                          child: ReorderableDelayedDragStartListener(
+                                            index: index,
+                                            child: ActionChip(
+                                              avatar: const Icon(
+                                                  Icons.bookmark_rounded,
+                                                  size: 18),
+                                              label: Text(b.name),
+                                              onPressed: () {
+                                                Navigator.of(context).push(
+                                                  MaterialPageRoute(
+                                                    builder: (_) =>
+                                                        BrowserScreen(
+                                                      title: b.name,
+                                                      rootPath: b.path,
+                                                    ),
+                                                  ),
+                                                );
+                                              },
+                                            ),
+                                          ),
+                                        );
+                                      },
+                                    ),
+                                  ),
+                                ],
+                              ),
+                            ),
+                          );
+                        },
                       ),
-                      itemCount: categories.length,
-                      itemBuilder: (context, index) => _CategoryTile(
-                        category: categories[index],
-                        label: sizes[categories[index].id],
+                      ValueListenableBuilder<Map<String, String>>(
+                        valueListenable: CategorySizeService.labels,
+                        builder: (context, sizes, _) => SliverPadding(
+                          padding: const EdgeInsets.all(12),
+                          sliver: SliverGrid(
+                            gridDelegate:
+                                SliverGridDelegateWithFixedCrossAxisCount(
+                              crossAxisCount: columns,
+                              mainAxisSpacing: 8,
+                              crossAxisSpacing: 8,
+                              childAspectRatio: 0.88,
+                            ),
+                            delegate: SliverChildBuilderDelegate(
+                              (context, index) => _CategoryTile(
+                                category: categories[index],
+                                label: sizes[categories[index].id],
+                              ),
+                              childCount: categories.length,
+                            ),
+                          ),
+                        ),
                       ),
-                    ),
+                    ],
                   ),
                 );
               },

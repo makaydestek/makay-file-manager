@@ -52,25 +52,21 @@ class _UpdateDialogState extends State<_UpdateDialog> {
             _progress = total > 0 ? (received / total).clamp(0.0, 1.0) : 0);
       });
       if (!mounted) return;
-      // Release'de .sha256 asset'i varsa doğrulama ZORUNLU.
-      if (widget.info.sha256.isNotEmpty) {
-        setState(() => _phase = _Phase.verifying);
-        final ok = await UpdateService.verifySha256(file, widget.info.sha256);
-        if (!mounted) return;
-        if (!ok) {
-          try {
-            await file.delete();
-          } catch (_) {
-            // Bozuk indirme silinemezse bir sonraki indirme benzersiz adla
-            // yazılır; asıl doğrulama hatası zaten kullanıcıya gösterilir.
-          }
-          setState(() {
-            _phase = _Phase.error;
-            _error =
-                'SHA256 doğrulaması başarısız — dosya bozuk, indirme iptal edildi.';
-          });
-          return;
-        }
+      // SHA256 zorunlu — özet yoksa veya eşleşmezse kurulum yapılmaz.
+      setState(() => _phase = _Phase.verifying);
+      final ok = await UpdateService.verifySha256(file, widget.info.sha256);
+      if (!mounted) return;
+      if (!ok) {
+        try {
+          await file.delete();
+        } catch (_) {}
+        setState(() {
+          _phase = _Phase.error;
+          _error = widget.info.sha256.trim().isEmpty
+              ? 'SHA256 özeti eksik — güvenlik nedeniyle kurulum iptal edildi.'
+              : 'SHA256 doğrulaması başarısız — dosya bozuk, indirme iptal edildi.';
+        });
+        return;
       }
       await UpdateService.install(file);
       if (!mounted) return;
@@ -130,7 +126,7 @@ class _UpdateDialogState extends State<_UpdateDialog> {
               const SizedBox(height: 4),
               Text(
                 'İndirme boyutu: ${Formats.size(widget.info.size)} • '
-                '${widget.info.sha256.isEmpty ? 'SHA256 özeti yayında yok' : 'SHA256 ile doğrulanacak'}',
+                'SHA256 ile doğrulanacak',
                 style: theme.textTheme.bodySmall,
               ),
             ],

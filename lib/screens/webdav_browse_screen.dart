@@ -26,7 +26,7 @@ class _WebDavBrowseScreenState extends State<WebDavBrowseScreen> {
   CloudLocation get _cloud => CloudLocation(
         name: widget.location.name,
         provider: 'WebDAV',
-        url: widget.location.host,
+        url: WebDavService.normalizeUrl(widget.location.host),
         username: widget.location.username,
         password: widget.location.password,
       );

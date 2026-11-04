@@ -15,8 +15,8 @@ class SftpSession {
   /// Bağlanır ve SFTP alt sistemini başlatır.
   static Future<SftpSession> connect(RemoteLocation loc) async {
     final socket = await SSHSocket.connect(
-      loc.host,
-      loc.port,
+      loc.cleanHost,
+      loc.effectivePort,
       timeout: const Duration(seconds: 15),
     );
     final client = SSHClient(

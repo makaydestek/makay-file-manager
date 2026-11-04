@@ -11,6 +11,7 @@ import '../services/clipboard_manager.dart';
 import '../services/media_service.dart';
 import '../utils/debug_log.dart';
 import '../utils/formats.dart';
+import '../widgets/tv_focusable.dart';
 import 'image_viewer_screen.dart';
 import 'media_viewer_screen.dart';
 
@@ -71,9 +72,13 @@ class _AlbumScreenState extends State<AlbumScreen> {
 
   final List<AssetEntity> _assets = [];
   final Set<String> _selected = {};
+  final _searchController = TextEditingController();
   bool _loading = true;
   bool _hasMore = true;
   bool _working = false;
+  bool _searchActive = false;
+  String _query = '';
+  int _gridColumns = 3;
 
   // Sıralama ve filtre (menülerden seçilir; varsayılan tarih ↓).
   _SortMode _sort = _SortMode.dateDesc;
@@ -84,7 +89,9 @@ class _AlbumScreenState extends State<AlbumScreen> {
 
   /// Herhangi bir filtre aktif mi (filtre ikonu vurgusu için).
   bool get _filtering =>
-      _dateFilter != _DateFilter.all || _typeFilter.isNotEmpty;
+      _dateFilter != _DateFilter.all ||
+      _typeFilter.isNotEmpty ||
+      _query.trim().isNotEmpty;
 
   /// Ada göre sıralama için başlıklar (asset kimliği → dosya adı).
   static final Map<String, String> _titleCache = {};
@@ -95,6 +102,12 @@ class _AlbumScreenState extends State<AlbumScreen> {
   void initState() {
     super.initState();
     _loadPage();
+  }
+
+  @override
+  void dispose() {
+    _searchController.dispose();
+    super.dispose();
   }
 
   Future<void> _loadPage() async {
@@ -138,6 +151,10 @@ class _AlbumScreenState extends State<AlbumScreen> {
     }
     if (_typeFilter.isNotEmpty) {
       list = list.where((a) => _extOf(a) == _typeFilter).toList();
+    }
+    final q = _query.trim().toLowerCase();
+    if (q.isNotEmpty) {
+      list = list.where((a) => _nameOf(a).toLowerCase().contains(q)).toList();
     }
     list = List<AssetEntity>.of(list);
     switch (_sort) {
@@ -301,65 +318,93 @@ class _AlbumScreenState extends State<AlbumScreen> {
   List<AssetEntity> get _selectedAssets =>
       _assets.where((a) => _selected.contains(a.id)).toList(growable: false);
 
-  /// Öğeye göre yerleşik görüntüleyici açılır (resim / video).
+  /// Kategori: video / ses / resim (isVideo yalnız videolar için true gelir;
+  /// ses ekranında false olduğu için kategoriId esas alınır).
+  bool get _isVideoCat =>
+      widget.categoryId == 'videos' || widget.isVideo;
+  bool get _isAudioCat => widget.categoryId == 'audio';
+
+  /// Öğeye göre yerleşik görüntüleyici açılır (resim / video / ses).
   ///
-  /// Büyük videolarda dosya çözümü (özellikle önbelleğe kopyalarken) zaman
-  /// alabilir; bu sırada ilerleme göstergesi sunulur ve her hata okunabilir
-  /// bir mesajla bildirilir — tıklamanın sessizce kaybolması önlenir.
+  /// Büyük videolarda dosya çözümü zaman alabilir; ilerleme göstergesi
+  /// sunulur. Ses albümünde artık resim görüntüleyiciye düşülmez — medya
+  /// oynatıcı + content:// yedeği kullanılır (F Dosya Yöneticisi uyumu).
   Future<void> _openAsset(AssetEntity asset) async {
     final messenger = ScaffoldMessenger.of(context);
     final navigator = Navigator.of(context);
     _showProgress();
     try {
-      if (widget.isVideo) {
-        final file = await _resolveVideo(asset);
+      final openAsVideo = _isVideoCat ||
+          (!_isAudioCat && asset.type == AssetType.video);
+      final openAsAudio = _isAudioCat ||
+          (!_isVideoCat && asset.type == AssetType.audio);
+
+      if (openAsVideo || openAsAudio) {
+        final resolved = await _resolveMedia(asset);
+        var title = _titleCache[asset.id] ?? '';
+        if (title.isEmpty) {
+          try {
+            title = await asset.titleAsync;
+            _titleCache[asset.id] = title;
+          } catch (e) {
+            logSwallowed('albüm: başlık', e);
+          }
+        }
         _hideProgress();
-        if (file == null) {
-          messenger.showSnackBar(const SnackBar(
-            content: Text('Video açılamadı: dosyaya erişilemedi'),
+        if (resolved.file == null && resolved.uri == null) {
+          messenger.showSnackBar(SnackBar(
+            content: Text(openAsVideo
+                ? 'Video açılamadı: dosyaya erişilemedi'
+                : 'Ses açılamadı: dosyaya erişilemedi'),
           ));
           return;
         }
         await navigator.push(
           MaterialPageRoute(
-            builder: (_) => MediaViewerScreen(file: file, isVideo: true),
+            builder: (_) => MediaViewerScreen(
+              file: resolved.file,
+              contentUri: resolved.uri,
+              isVideo: openAsVideo,
+              title: title,
+            ),
           ),
         );
-      } else {
-        File? file;
-        try {
-          file = await asset.file;
-          if (file != null && !await file.exists()) file = null;
-        } catch (_) {
-          file = null;
-        }
-        Uint8List? bytes;
-        if (file == null) {
-          // Dosya erişilemiyorsa yüksek çözünürlüklü küçük resme düşülür.
-          bytes = await asset
-              .thumbnailDataWithSize(const ThumbnailSize(2048, 2048));
-        }
-        _hideProgress();
-        if (file == null && bytes == null) {
-          messenger.showSnackBar(const SnackBar(
-            content: Text('Resim açılamadı: dosyaya erişilemedi'),
-          ));
-          return;
-        }
-        var title = '';
-        try {
-          title = await asset.titleAsync;
-        } catch (e) {
-          logSwallowed('albüm: başlık', e);
-        }
-        await navigator.push(
-          MaterialPageRoute(
-            builder: (_) => file != null
-                ? ImageViewerScreen(file: file, title: title)
-                : ImageViewerScreen(bytes: bytes, title: title),
-          ),
-        );
+        return;
       }
+
+      // Resim (veya bilinmeyen → görüntüleyici).
+      File? file;
+      try {
+        file = await asset.file;
+        if (file != null && !await file.exists()) file = null;
+      } catch (_) {
+        file = null;
+      }
+      Uint8List? bytes;
+      if (file == null) {
+        bytes = await asset
+            .thumbnailDataWithSize(const ThumbnailSize(2048, 2048));
+      }
+      _hideProgress();
+      if (file == null && bytes == null) {
+        messenger.showSnackBar(const SnackBar(
+          content: Text('Resim açılamadı: dosyaya erişilemedi'),
+        ));
+        return;
+      }
+      var title = '';
+      try {
+        title = await asset.titleAsync;
+      } catch (e) {
+        logSwallowed('albüm: başlık', e);
+      }
+      await navigator.push(
+        MaterialPageRoute(
+          builder: (_) => file != null
+              ? ImageViewerScreen(file: file, title: title)
+              : ImageViewerScreen(bytes: bytes, title: title),
+        ),
+      );
     } catch (e) {
       _hideProgress();
       messenger.showSnackBar(
@@ -368,8 +413,11 @@ class _AlbumScreenState extends State<AlbumScreen> {
     }
   }
 
-  /// Video dosyasını çözer: önce doğrudan dosya, olmazsa orijinal dosya.
-  Future<File?> _resolveVideo(AssetEntity asset) async {
+  /// Medya dosyası + isteğe bağlı content:// URI.
+  ///
+  /// Android'de [AssetEntity.getMediaUrl] ExoPlayer için tercih edilir;
+  /// dosya yolu tarayıcı/yedek ve "Farklı aç" için tutulur.
+  Future<({File? file, Uri? uri})> _resolveMedia(AssetEntity asset) async {
     File? f;
     try {
       f = await asset.file;
@@ -377,14 +425,24 @@ class _AlbumScreenState extends State<AlbumScreen> {
     } catch (_) {
       f = null;
     }
-    if (f != null) return f;
-    try {
-      f = await asset.originFile;
-      if (f != null && !await f.exists()) f = null;
-    } catch (_) {
-      f = null;
+    if (f == null) {
+      try {
+        f = await asset.originFile;
+        if (f != null && !await f.exists()) f = null;
+      } catch (_) {
+        f = null;
+      }
     }
-    return f;
+    Uri? uri;
+    try {
+      final url = await asset.getMediaUrl();
+      if (url != null && url.isNotEmpty) {
+        uri = Uri.tryParse(url);
+      }
+    } catch (e) {
+      logSwallowed('albüm: mediaUrl', e);
+    }
+    return (file: f, uri: uri);
   }
 
   // -------------------------------------------------------------------------
@@ -541,7 +599,20 @@ class _AlbumScreenState extends State<AlbumScreen> {
             : null,
         title: _selecting
             ? Text('${_selected.length} seçili')
-            : Text(widget.title),
+            : (_searchActive
+                ? TextField(
+                    controller: _searchController,
+                    autofocus: true,
+                    decoration: const InputDecoration(
+                      hintText: 'Dosya ara…',
+                      border: InputBorder.none,
+                    ),
+                    onChanged: (v) => setState(() {
+                      _query = v;
+                      _visibleCache = null;
+                    }),
+                  )
+                : Text(widget.title)),
         // Toplam özet: görünür öğe sayısı + toplam boyut (filtre/arama
         // uygulandığında "görünür / toplam" olarak yazılır).
         bottom: _selecting
@@ -584,6 +655,21 @@ class _AlbumScreenState extends State<AlbumScreen> {
                 ),
               ]
             : [
+                IconButton(
+                  icon: Icon(
+                      _searchActive ? Icons.close_rounded : Icons.search),
+                  tooltip: _searchActive ? 'Aramayı kapat' : 'Ara',
+                  onPressed: () {
+                    setState(() {
+                      _searchActive = !_searchActive;
+                      if (!_searchActive) {
+                        _searchController.clear();
+                        _query = '';
+                        _visibleCache = null;
+                      }
+                    });
+                  },
+                ),
                 // Sıralama menüsü (referans uygulamadaki gibi).
                 PopupMenuButton<_SortMode>(
                   icon: const Icon(Icons.sort_rounded),
@@ -600,13 +686,28 @@ class _AlbumScreenState extends State<AlbumScreen> {
                       ),
                   ],
                 ),
+                IconButton(
+                  icon: Icon(_gridColumns >= 4
+                      ? Icons.view_list_rounded
+                      : Icons.grid_view_rounded),
+                  tooltip: 'Izgara yoğunluğu',
+                  onPressed: () {
+                    setState(() {
+                      _gridColumns = switch (_gridColumns) {
+                        2 => 3,
+                        3 => 4,
+                        _ => 2,
+                      };
+                    });
+                  },
+                ),
                 // Filtre menüsü: tarih aralığı + dosya türü.
                 PopupMenuButton<Object>(
                   icon: Icon(
                     Icons.filter_alt_rounded,
                     color: _filtering
-                        ? null
-                        : Theme.of(context).colorScheme.primary,
+                        ? Theme.of(context).colorScheme.primary
+                        : null,
                   ),
                   tooltip: 'Filtrele',
                   onSelected: _onFilterSelected,
@@ -649,14 +750,44 @@ class _AlbumScreenState extends State<AlbumScreen> {
                       ),
                   ],
                 ),
+                PopupMenuButton<String>(
+                  tooltip: 'Diğer',
+                  onSelected: (value) async {
+                    switch (value) {
+                      case 'refresh':
+                        setState(() {
+                          _assets.clear();
+                          _hasMore = true;
+                          _loading = true;
+                          _visibleCache = null;
+                        });
+                        MediaService.clearCache();
+                        await _loadPage();
+                      case 'select_all':
+                        setState(() {
+                          _selected
+                            ..clear()
+                            ..addAll(_visible.map((a) => a.id));
+                        });
+                      case 'settings':
+                        Navigator.of(context).pushNamed('/settings');
+                    }
+                  },
+                  itemBuilder: (context) => const [
+                    PopupMenuItem(
+                        value: 'select_all', child: Text('Tümünü seç')),
+                    PopupMenuItem(value: 'refresh', child: Text('Yenile')),
+                    PopupMenuItem(value: 'settings', child: Text('Ayarlar')),
+                  ],
+                ),
               ],
       ),
       body: _loading
           ? const Center(child: CircularProgressIndicator())
           : GridView.builder(
               padding: const EdgeInsets.all(4),
-              gridDelegate: const SliverGridDelegateWithFixedCrossAxisCount(
-                crossAxisCount: 3,
+              gridDelegate: SliverGridDelegateWithFixedCrossAxisCount(
+                crossAxisCount: _gridColumns,
                 mainAxisSpacing: 4,
                 crossAxisSpacing: 4,
               ),
@@ -672,34 +803,45 @@ class _AlbumScreenState extends State<AlbumScreen> {
                 }
                 final asset = _visible[index];
                 final selected = _selected.contains(asset.id);
-                return InkWell(
-                  onTap: () => _selecting
-                      ? _toggleSelect(asset)
-                      : _openAsset(asset),
-                  onLongPress: () => _toggleSelect(asset),
-                  child: Stack(
-                    fit: StackFit.expand,
-                    children: [
-                      _AssetThumb(asset: asset),
-                      if (widget.isVideo)
-                        const Center(
-                          child: Icon(Icons.play_circle_fill_rounded,
-                              color: Colors.white70, size: 36),
-                        ),
-                      if (selected)
-                        Container(
-                          color: Theme.of(context)
-                              .colorScheme
-                              .primary
-                              .withValues(alpha: 0.35),
-                          alignment: Alignment.topRight,
-                          padding: const EdgeInsets.all(6),
-                          child: Icon(
-                            Icons.check_circle_rounded,
-                            color: Theme.of(context).colorScheme.primary,
+                void activate() => _selecting
+                    ? _toggleSelect(asset)
+                    : _openAsset(asset);
+                return TvFocusable(
+                  autofocus: index == 0,
+                  onActivate: activate,
+                  borderRadius: 6,
+                  child: InkWell(
+                    onTap: activate,
+                    onLongPress: () => _toggleSelect(asset),
+                    child: Stack(
+                      fit: StackFit.expand,
+                      children: [
+                        _AssetThumb(asset: asset),
+                        if (_isVideoCat)
+                          const Center(
+                            child: Icon(Icons.play_circle_fill_rounded,
+                                color: Colors.white70, size: 36),
+                          )
+                        else if (_isAudioCat)
+                          const Center(
+                            child: Icon(Icons.music_note_rounded,
+                                color: Colors.white70, size: 36),
                           ),
-                        ),
-                    ],
+                        if (selected)
+                          Container(
+                            color: Theme.of(context)
+                                .colorScheme
+                                .primary
+                                .withValues(alpha: 0.35),
+                            alignment: Alignment.topRight,
+                            padding: const EdgeInsets.all(6),
+                            child: Icon(
+                              Icons.check_circle_rounded,
+                              color: Theme.of(context).colorScheme.primary,
+                            ),
+                          ),
+                      ],
+                    ),
                   ),
                 );
               },

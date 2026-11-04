@@ -119,9 +119,108 @@ class _CloudScreenState extends State<CloudScreen> {
       ),
     );
     if (ok != true) return;
-    _locations.remove(loc);
+    final i = _locations.indexOf(loc);
+    if (i < 0) return;
+    _locations.removeAt(i);
+    await CloudLocationStore.save(_locations);
+    if (mounted) setState(() {});
+  }
+
+  Future<void> _editCloud(CloudLocation loc) async {
+    final i = _locations.indexOf(loc);
+    if (i < 0) return;
+    final edited = await showDialog<CloudLocation>(
+      context: context,
+      builder: (_) => _EditCloudDialog(location: loc),
+    );
+    if (edited == null || !mounted) return;
+    _locations[i] = edited;
     await CloudLocationStore.save(_locations);
     setState(() {});
+    if (!mounted) return;
+    ScaffoldMessenger.of(context).showSnackBar(
+      SnackBar(content: Text('"${edited.name}" güncellendi')),
+    );
+  }
+
+  Future<void> _renameCloud(CloudLocation loc) async {
+    final i = _locations.indexOf(loc);
+    if (i < 0) return;
+    final controller = TextEditingController(text: loc.name);
+    final name = await showDialog<String>(
+      context: context,
+      builder: (context) => AlertDialog(
+        title: const Text('Yeniden adlandır'),
+        content: TextField(
+          controller: controller,
+          autofocus: true,
+          decoration: const InputDecoration(labelText: 'Bağlantı adı'),
+        ),
+        actions: [
+          TextButton(
+            onPressed: () => Navigator.pop(context),
+            child: const Text('Vazgeç'),
+          ),
+          FilledButton(
+            onPressed: () => Navigator.pop(context, controller.text.trim()),
+            child: const Text('Kaydet'),
+          ),
+        ],
+      ),
+    );
+    if (name == null || name.isEmpty || name == loc.name) return;
+    _locations[i] = loc.copyWith(name: name);
+    await CloudLocationStore.save(_locations);
+    if (mounted) setState(() {});
+  }
+
+  void _showCloudMenu(CloudLocation loc) {
+    showModalBottomSheet<void>(
+      context: context,
+      isScrollControlled: true,
+      builder: (context) => SafeArea(
+        child: SingleChildScrollView(
+          child: Column(
+            mainAxisSize: MainAxisSize.min,
+            children: [
+              ListTile(
+                leading: const Icon(Icons.cloud_rounded),
+                title: Text(loc.name),
+                subtitle: Text('${loc.provider} • ${loc.username}'),
+              ),
+              const Divider(height: 1),
+              ListTile(
+                leading: const Icon(Icons.edit_rounded),
+                title: const Text('Düzenle'),
+                onTap: () {
+                  Navigator.pop(context);
+                  _editCloud(loc);
+                },
+              ),
+              ListTile(
+                leading: const Icon(Icons.drive_file_rename_outline_rounded),
+                title: const Text('Yeniden adlandır'),
+                onTap: () {
+                  Navigator.pop(context);
+                  _renameCloud(loc);
+                },
+              ),
+              ListTile(
+                leading: Icon(Icons.delete_outline_rounded,
+                    color: Theme.of(context).colorScheme.error),
+                title: Text('Kaldır',
+                    style:
+                        TextStyle(color: Theme.of(context).colorScheme.error)),
+                onTap: () {
+                  Navigator.pop(context);
+                  _delete(loc);
+                },
+              ),
+            ],
+          ),
+        ),
+      ),
+    );
   }
 
   @override
@@ -268,12 +367,108 @@ class _CloudScreenState extends State<CloudScreen> {
       title: Text(loc.name),
       subtitle: Text('${loc.provider} • ${loc.username}'),
       trailing: IconButton(
-        icon: const Icon(Icons.delete_outline_rounded),
-        onPressed: () => _delete(loc),
+        icon: const Icon(Icons.more_vert_rounded),
+        tooltip: 'Düzenle / sil',
+        onPressed: () => _showCloudMenu(loc),
       ),
       onTap: () => Navigator.of(context).push(
         MaterialPageRoute(builder: (_) => CloudBrowseScreen(location: loc)),
       ),
+      onLongPress: () => _showCloudMenu(loc),
+    );
+  }
+}
+
+/// Kayıtlı WebDAV / Nextcloud hesabını düzenleme diyaloğu.
+class _EditCloudDialog extends StatefulWidget {
+  const _EditCloudDialog({required this.location});
+
+  final CloudLocation location;
+
+  @override
+  State<_EditCloudDialog> createState() => _EditCloudDialogState();
+}
+
+class _EditCloudDialogState extends State<_EditCloudDialog> {
+  late final TextEditingController _name;
+  late final TextEditingController _url;
+  late final TextEditingController _username;
+  late final TextEditingController _password;
+
+  @override
+  void initState() {
+    super.initState();
+    final loc = widget.location;
+    _name = TextEditingController(text: loc.name);
+    _url = TextEditingController(text: loc.url);
+    _username = TextEditingController(text: loc.username);
+    _password = TextEditingController(text: loc.password);
+  }
+
+  @override
+  void dispose() {
+    _name.dispose();
+    _url.dispose();
+    _username.dispose();
+    _password.dispose();
+    super.dispose();
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    return AlertDialog(
+      title: const Text('Bulut konumunu düzenle'),
+      content: SingleChildScrollView(
+        child: Column(
+          mainAxisSize: MainAxisSize.min,
+          children: [
+            TextField(
+              controller: _name,
+              autofocus: true,
+              decoration: const InputDecoration(labelText: 'Bağlantı adı'),
+            ),
+            const SizedBox(height: 12),
+            TextField(
+              controller: _url,
+              decoration: const InputDecoration(labelText: 'WebDAV adresi (URL)'),
+            ),
+            const SizedBox(height: 12),
+            TextField(
+              controller: _username,
+              decoration: const InputDecoration(labelText: 'Kullanıcı adı'),
+            ),
+            const SizedBox(height: 12),
+            TextField(
+              controller: _password,
+              decoration: const InputDecoration(labelText: 'Şifre'),
+              obscureText: true,
+            ),
+          ],
+        ),
+      ),
+      actions: [
+        TextButton(
+          onPressed: () => Navigator.pop(context),
+          child: const Text('Vazgeç'),
+        ),
+        FilledButton(
+          onPressed: () {
+            final name = _name.text.trim();
+            final url = _url.text.trim();
+            if (url.isEmpty) return;
+            Navigator.pop(
+              context,
+              widget.location.copyWith(
+                name: name.isEmpty ? widget.location.provider : name,
+                url: url,
+                username: _username.text.trim(),
+                password: _password.text,
+              ),
+            );
+          },
+          child: const Text('Güncelle'),
+        ),
+      ],
     );
   }
 }

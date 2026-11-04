@@ -1,5 +1,7 @@
 import 'package:flutter/material.dart';
 
+import '../screens/browser_screen.dart';
+import '../services/bookmark_service.dart';
 import '../services/category_size_service.dart';
 import '../services/recycle_bin_service.dart';
 import '../theme/app_theme.dart';
@@ -21,6 +23,7 @@ class _AppDrawerState extends State<AppDrawer> {
   void initState() {
     super.initState();
     _loadRecycle();
+    BookmarkStore.load();
   }
 
   Future<void> _loadRecycle() async {
@@ -77,6 +80,71 @@ class _AppDrawerState extends State<AppDrawer> {
                     trailing: Text(Formats.size(_recycleSize)),
                     onTap: () => Navigator.of(context).pushNamed('/recycle'),
                   ),
+                  ValueListenableBuilder<List<Bookmark>>(
+                    valueListenable: BookmarkStore.list,
+                    builder: (context, bookmarks, _) {
+                      if (bookmarks.isEmpty) return const SizedBox.shrink();
+                      return Column(
+                        crossAxisAlignment: CrossAxisAlignment.stretch,
+                        children: [
+                          const Divider(),
+                          Padding(
+                            padding: const EdgeInsets.fromLTRB(16, 8, 16, 4),
+                            child: Text(
+                              'Yer imleri',
+                              style: Theme.of(context)
+                                  .textTheme
+                                  .titleSmall
+                                  ?.copyWith(
+                                    color:
+                                        Theme.of(context).colorScheme.primary,
+                                    fontWeight: FontWeight.bold,
+                                  ),
+                            ),
+                          ),
+                          ReorderableListView.builder(
+                            shrinkWrap: true,
+                            physics: const NeverScrollableScrollPhysics(),
+                            buildDefaultDragHandles: false,
+                            itemCount: bookmarks.length,
+                            onReorderItem: BookmarkStore.reorder,
+                            itemBuilder: (context, index) {
+                              final b = bookmarks[index];
+                              return ListTile(
+                                key: ValueKey(b.path),
+                                leading: ReorderableDragStartListener(
+                                  index: index,
+                                  child: Icon(
+                                    Icons.bookmark_rounded,
+                                    color:
+                                        Theme.of(context).colorScheme.primary,
+                                  ),
+                                ),
+                                title: Text(b.name),
+                                trailing: IconButton(
+                                  icon: const Icon(Icons.close_rounded, size: 18),
+                                  tooltip: 'Kaldır',
+                                  onPressed: () =>
+                                      BookmarkStore.remove(b.path),
+                                ),
+                                onTap: () {
+                                  Navigator.of(context).pop();
+                                  Navigator.of(context).push(
+                                    MaterialPageRoute(
+                                      builder: (_) => BrowserScreen(
+                                        title: b.name,
+                                        rootPath: b.path,
+                                      ),
+                                    ),
+                                  );
+                                },
+                              );
+                            },
+                          ),
+                        ],
+                      );
+                    },
+                  ),
                   const Divider(),
                   _DrawerItem(
                     icon: Icons.schedule_rounded,
@@ -112,6 +180,22 @@ class _AppDrawerState extends State<AppDrawer> {
                         Navigator.of(context).pushNamed('/browse/downloads'),
                   ),
                   const Divider(),
+                  // Ana ekran kartlarıyla aynı bölümler — tek listede.
+                  _DrawerItem(
+                    icon: Icons.pie_chart_rounded,
+                    title: 'Bellek Analizi',
+                    onTap: () => Navigator.of(context).pushNamed('/analysis'),
+                  ),
+                  _DrawerItem(
+                    icon: Icons.apps_rounded,
+                    title: 'Uygulamalar',
+                    onTap: () => Navigator.of(context).pushNamed('/apps'),
+                  ),
+                  _DrawerItem(
+                    icon: Icons.cleaning_services_rounded,
+                    title: 'Temizlik merkezi',
+                    onTap: () => Navigator.of(context).pushNamed('/clean'),
+                  ),
                   _DrawerItem(
                     icon: Icons.lock_outline_rounded,
                     title: 'Kasa',
@@ -128,6 +212,12 @@ class _AppDrawerState extends State<AppDrawer> {
                     onTap: () =>
                         Navigator.of(context).pushNamed('/duplicates'),
                   ),
+                  _DrawerItem(
+                    icon: Icons.privacy_tip_rounded,
+                    title: 'Gizlilik',
+                    onTap: () =>
+                        Navigator.of(context).pushNamed('/privacy'),
+                  ),
                   const Divider(),
                   _DrawerItem(
                     icon: Icons.desktop_windows_rounded,
@@ -138,6 +228,12 @@ class _AppDrawerState extends State<AppDrawer> {
                     icon: Icons.devices_rounded,
                     title: 'Ağdan erişim',
                     onTap: () => Navigator.of(context).pushNamed('/network'),
+                  ),
+                  const Divider(),
+                  _DrawerItem(
+                    icon: Icons.settings_rounded,
+                    title: 'Ayarlar',
+                    onTap: () => Navigator.of(context).pushNamed('/settings'),
                   ),
                 ],
               ),

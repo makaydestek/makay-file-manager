@@ -64,7 +64,10 @@ class CategorySizeService {
 
   /// Uygulama ön plana döndüğünde taramanın en az ne kadar önce yapılmış
   /// olması gerektiği (hızlı uygulama geçişlerinde gereksiz tarama yok).
-  static const resumeMinInterval = Duration(seconds: 60);
+  ///
+  /// İndirme/silme sonrası ana sayfa kartlarının F Dosya Yöneticisi kadar
+  /// canlı kalması için kısa tutulur; 60 sn bayatlık bırakırdı.
+  static const resumeMinInterval = Duration(seconds: 8);
 
   /// Kategori kimliği → başlık altı metin (ör. "1,5 GB", "3 hesap").
   static final ValueNotifier<Map<String, String>> labels =
@@ -277,8 +280,13 @@ class CategorySizeService {
         // Tarama tüm klasör anahtarlarını üretti: eskileri devralma
         // yok — 0 B gibi taze sıfırlar da ekrana yazılır.
         inherited.clear();
+        // Boyut anahtarları + isteğe bağlı `*_n` adet anahtarları.
         for (final e in folder.entries) {
-          out[e.key] = Formats.size(e.value);
+          if (e.key.endsWith('_n')) continue;
+          final count = folder['${e.key}_n'];
+          out[e.key] = (count != null && count > 0)
+              ? '${Formats.size(e.value)} ($count)'
+              : Formats.size(e.value);
         }
       }
 
@@ -450,11 +458,23 @@ class CategorySizeService {
     int maxEntries = 60000,
   }) {
     final sep = Platform.pathSeparator;
+    final downloads = dirStats('$root${sep}Download', skipHidden: true);
+    final documents = dirStats('$root${sep}Documents', skipHidden: true);
+    final media = classifySizesAndCounts(root, maxEntries: maxEntries);
+    final recent = recentStats(
+      root,
+      maxEntries: maxEntries,
+      seen: seenRecent,
+    );
     return {
-      'downloads': dirSize('$root${sep}Download', skipHidden: true),
-      'documents': dirSize('$root${sep}Documents', skipHidden: true),
-      ...classifySizes(root, maxEntries: maxEntries),
-      'recent': recentSize(root, maxEntries: maxEntries, seen: seenRecent),
+      'downloads': downloads.bytes,
+      'downloads_n': downloads.count,
+      'documents': documents.bytes,
+      'documents_n': documents.count,
+      ...media.sizes,
+      for (final e in media.counts.entries) '${e.key}_n': e.value,
+      'recent': recent.bytes,
+      'recent_n': recent.count,
     };
   }
 
@@ -469,9 +489,23 @@ class CategorySizeService {
   static Map<String, int> classifySizes(
     String root, {
     int maxEntries = 60000,
+  }) =>
+      classifySizesAndCounts(root, maxEntries: maxEntries).sizes;
+
+  /// Medya boyutu + adet (tek yürüyüş).
+  @visibleForTesting
+  static ({Map<String, int> sizes, Map<String, int> counts})
+      classifySizesAndCounts(
+    String root, {
+    int maxEntries = 60000,
   }) {
     final sep = Platform.pathSeparator;
     final totals = <String, int>{
+      'images': 0,
+      'videos': 0,
+      'audio': 0,
+    };
+    final counts = <String, int>{
       'images': 0,
       'videos': 0,
       'audio': 0,
@@ -494,24 +528,21 @@ class CategorySizeService {
         if (name.isEmpty || name.startsWith('.')) continue;
         if (e is Directory) {
           if (name == 'LOST.DIR') continue;
-          // Galeri'de gizlenen (`.nomedia` işaretli) klasörler kart
-          // toplamına girmez: medya listeleriyle birebir aynı kalır.
           if (isHiddenByNomedia(e.path, name: name)) continue;
           stack.add(e.path);
         } else if (e is File) {
           final category = categoryOfExtension(_extensionOf(name));
-          // Yalnızca medya kategorileri burada toplanır; 'documents' vb.
-          // sınıflandırması kartların şişmesine yol açardı.
           if (category == null || !totals.containsKey(category)) continue;
           try {
             totals[category] = totals[category]! + e.lengthSync();
-          } catch (e) {
-            logSwallowed('kategori boyutu: dosya boyutu', e);
+            counts[category] = counts[category]! + 1;
+          } catch (err) {
+            logSwallowed('kategori boyutu: dosya boyutu', err);
           }
         }
       }
     }
-    return totals;
+    return (sizes: totals, counts: counts);
   }
 
   /// Klasörün özyinelemeli toplam boyutu (erişim hataları yutulur).
@@ -520,31 +551,40 @@ class CategorySizeService {
   /// ve Belgeler kartları ekranın varsayılan görünümüyle (gizli gizli) birebir
   /// aynı toplamı verir.
   @visibleForTesting
-  static int dirSize(String path, {bool skipHidden = false}) {
+  static int dirSize(String path, {bool skipHidden = false}) =>
+      dirStats(path, skipHidden: skipHidden).bytes;
+
+  /// Klasör boyutu + dosya adedi (kart etiketinde "1,5 GB (42)").
+  @visibleForTesting
+  static ({int bytes, int count}) dirStats(
+    String path, {
+    bool skipHidden = false,
+  }) {
     final dir = Directory(path);
-    if (!dir.existsSync()) return 0;
+    if (!dir.existsSync()) return (bytes: 0, count: 0);
     var total = 0;
+    var count = 0;
     try {
       for (final e in dir.listSync(followLinks: false)) {
         if (skipHidden && _nameOf(e.path).startsWith('.')) continue;
         if (e is File) {
           try {
             total += e.lengthSync();
-          } catch (e) {
-            logSwallowed('kategori boyutu: dosya boyutu', e);
+            count++;
+          } catch (err) {
+            logSwallowed('kategori boyutu: dosya boyutu', err);
           }
         } else if (e is Directory) {
-          // Galeri gizlemesi (`.nomedia`): yalnız "gizli gizle" modunda
-          // atlanır; ekranın varsayılan görünümüyle toplam birebir aynı
-          // kalır (kök klasörün kendisi değil, alt klasörleri kontrol edilir).
           if (skipHidden && isHiddenByNomedia(e.path)) continue;
-          total += dirSize(e.path, skipHidden: skipHidden);
+          final nested = dirStats(e.path, skipHidden: skipHidden);
+          total += nested.bytes;
+          count += nested.count;
         }
       }
     } catch (e) {
       logSwallowed('kategori boyutu: yürüyüş', e);
     }
-    return total;
+    return (bytes: total, count: count);
   }
 
   /// Son 7 günde değişen dosyaların toplam boyutu ("Yeni Dosyalar").
@@ -559,9 +599,18 @@ class CategorySizeService {
     String root, {
     int maxEntries = 60000,
     Set<String> seen = const {},
+  }) =>
+      recentStats(root, maxEntries: maxEntries, seen: seen).bytes;
+
+  @visibleForTesting
+  static ({int bytes, int count}) recentStats(
+    String root, {
+    int maxEntries = 60000,
+    Set<String> seen = const {},
   }) {
     final cutoff = DateTime.now().subtract(const Duration(days: 7));
     var total = 0;
+    var count = 0;
     var visited = 0;
     final stack = <String>[root];
     while (stack.isNotEmpty && visited < maxEntries) {
@@ -574,30 +623,27 @@ class CategorySizeService {
       }
       for (final e in items) {
         if (++visited >= maxEntries) break;
-        // Not: uri.pathSegments.last dizinlerde boş döner (sondaki "/" yüzünden);
-        // bu yüzden ad her zaman yolun son ögesinden alınır.
         final name = _nameOf(e.path);
         if (name.isEmpty || name.startsWith('.')) continue;
         if (e is Directory) {
-          // Ağır/sistem dizimleri atlanır (izolasyon hataları vb.).
           if (name == 'Android' || name == 'LOST.DIR') continue;
           stack.add(e.path);
         } else if (e is File) {
           try {
             final stat = e.statSync();
             if (!stat.modified.isAfter(cutoff)) continue;
-            // "Temizle" ile görülmüş dosya kart boyutuna girmez.
             if (seen.contains(RecentSeenStore.keyOf(e.path, stat.modified))) {
               continue;
             }
             total += stat.size;
-          } catch (e) {
-            logSwallowed('kategori boyutu: son 7 gün', e);
+            count++;
+          } catch (err) {
+            logSwallowed('kategori boyutu: son 7 gün', err);
           }
         }
       }
     }
-    return total;
+    return (bytes: total, count: count);
   }
 
   /// Dosya adının uzantısı (nokta yoksa boş).

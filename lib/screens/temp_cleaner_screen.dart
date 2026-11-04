@@ -1,4 +1,5 @@
 import 'dart:io';
+import 'dart:isolate';
 
 import 'package:flutter/foundation.dart' show kIsWeb;
 import 'package:flutter/material.dart';
@@ -7,6 +8,7 @@ import 'package:path_provider/path_provider.dart';
 import '../utils/debug_log.dart';
 import '../utils/formats.dart';
 import '../services/category_size_service.dart';
+import '../services/heavy_scan.dart';
 
 /// Geçici dosyalar ekranı: uygulama önbelleği, küçük resim (.thumbnails)
 /// önbelleği ve .tmp/.part gibi yarıda kalmış dosyaların temizliği.
@@ -62,31 +64,44 @@ class _TempCleanerScreenState extends State<TempCleanerScreen> {
     var thumbs = 0;
     final temps = <_TempItem>[];
 
-    // 1) Uygulama önbelleği (dahili dizin — her platformda).
+    // 1) Uygulama önbelleği (dahili dizin — her platformda; küçük).
     try {
-      final tmp = await getTemporaryDirectory();
-      cache = _dirSize(tmp);
+      final tmpPath = (await getTemporaryDirectory()).path;
+      cache = await Isolate.run(() {
+        var total = 0;
+        try {
+          for (final e
+              in Directory(tmpPath).listSync(recursive: true, followLinks: false)) {
+            if (e is File) {
+              try {
+                total += e.lengthSync();
+              } catch (_) {}
+            }
+          }
+        } catch (_) {}
+        return total;
+      });
     } catch (_) {
       // Dahili önbellek dizini desteklenmeyen platformda/izinde yoktur;
       // önbellek boyutu 0 kalır, temizlik yine de güvenlidir.
     }
 
-    // 2) Genel depolama (yalnızca Android).
+    // 2) Genel depolama (yalnızca Android) — ağır tarama izolatta.
     if (!kIsWeb && Platform.isAndroid) {
-      final thumbDir = Directory('$_androidRoot/DCIM/.thumbnails');
-      if (thumbDir.existsSync()) thumbs = _dirSize(thumbDir);
-
-      final seen = <String>{};
-      for (final entry in <(String, int)>[
-        ('$_androidRoot/Download', 3),
-        ('$_androidRoot/Documents', 3),
-        (_androidRoot, 1),
-      ]) {
-        _scanTemps(Directory(entry.$1), temps, depth: entry.$2, seen: seen);
+      try {
+        final scanned = await HeavyScan.tempScan(
+          androidRoot: _androidRoot,
+          suffixes: _tempSuffixes,
+        );
+        thumbs = scanned.thumbBytes;
+        for (final item in scanned.temps) {
+          temps.add(_TempItem(File(item.$1), item.$2));
+        }
+      } catch (e) {
+        logSwallowed('temp_cleaner: izolat tarama', e);
       }
     }
 
-    temps.sort((a, b) => b.size.compareTo(a.size));
     if (!mounted) return;
     setState(() {
       _cacheSize = cache;
@@ -96,69 +111,6 @@ class _TempCleanerScreenState extends State<TempCleanerScreen> {
         ..addAll(temps);
       _loading = false;
     });
-  }
-
-  /// Dizinin (alt dahil) toplam boyutu; hata olursa 0.
-  int _dirSize(Directory dir) {
-    var total = 0;
-    try {
-      for (final e in dir.listSync(recursive: true, followLinks: false)) {
-        if (e is File) {
-          try {
-            total += e.lengthSync();
-          } catch (e) {
-            logSwallowed('temp_cleaner: boyut', e);
-          }
-        }
-      }
-    } catch (e) {
-      logSwallowed('temp_cleaner: yürüyüş', e);
-    }
-    return total;
-  }
-
-  /// Geçici dosya desenlerine uyan dosyaları toplar (derinlik sınırlı).
-  void _scanTemps(
-    Directory dir,
-    List<_TempItem> out, {
-    required int depth,
-    required Set<String> seen,
-  }) {
-    if (out.length >= 500) return;
-    List<FileSystemEntity> entries;
-    try {
-      entries = dir.listSync(followLinks: false);
-    } catch (_) {
-      return;
-    }
-    for (final e in entries) {
-      if (out.length >= 500) return;
-      if (e is File) {
-        final name = e.path.split(Platform.pathSeparator).last.toLowerCase();
-        if (_isTempName(name) && seen.add(e.path)) {
-          try {
-            out.add(_TempItem(e, e.lengthSync()));
-          } catch (e) {
-            logSwallowed('temp_cleaner: geçici dosya ölçümü', e);
-          }
-        }
-      } else if (e is Directory && depth > 0) {
-        final lower = e.path.toLowerCase();
-        // Sistem/uygulama alanlarına girmeyiz.
-        if (lower.endsWith('/android') || lower.endsWith('/.thumbnails')) {
-          continue;
-        }
-        _scanTemps(e, out, depth: depth - 1, seen: seen);
-      }
-    }
-  }
-
-  bool _isTempName(String lowerName) {
-    if (lowerName.endsWith('~')) return true;
-    for (final s in _tempSuffixes) {
-      if (lowerName.endsWith(s)) return true;
-    }
-    return false;
   }
 
   Future<void> _deleteAll(Iterable<File> files) async {

@@ -52,6 +52,7 @@ class _LanScanScreenState extends State<LanScanScreen> {
       },
     );
     if (!mounted) return;
+    devices.sort((a, b) => a.ip.compareTo(b.ip));
     setState(() {
       _devices = devices;
       _scanning = false;
@@ -137,7 +138,17 @@ class _LanScanScreenState extends State<LanScanScreen> {
   Widget build(BuildContext context) {
     final theme = Theme.of(context);
     return Scaffold(
-      appBar: AppBar(title: const Text('Yerel ağ taraması')),
+      appBar: AppBar(
+        title: const Text('Yerel ağ taraması'),
+        actions: [
+          if (!_scanning)
+            IconButton(
+              icon: const Icon(Icons.refresh_rounded),
+              tooltip: 'Yeniden tara',
+              onPressed: _start,
+            ),
+        ],
+      ),
       body: _scanning
           ? Center(
               child: Padding(
@@ -152,18 +163,36 @@ class _LanScanScreenState extends State<LanScanScreen> {
                     const SizedBox(height: 8),
                     LinearProgressIndicator(
                         value: _total > 0 ? _done / _total : null),
+                    const SizedBox(height: 16),
+                    Text(
+                      '445 / 21 / 22 / 80 / 443 portları sınanır',
+                      style: theme.textTheme.bodySmall?.copyWith(
+                        color: theme.colorScheme.outline,
+                      ),
+                    ),
                   ],
                 ),
               ),
             )
           : _subnet == null
-              ? const Center(
+              ? Center(
                   child: Padding(
-                    padding: EdgeInsets.all(32),
-                    child: Text(
-                      'Yerel ağ adresi bulunamadı.\n'
-                      'Wi-Fi\'ye bağlı olduğunuzdan emin olun.',
-                      textAlign: TextAlign.center,
+                    padding: const EdgeInsets.all(32),
+                    child: Column(
+                      mainAxisSize: MainAxisSize.min,
+                      children: [
+                        const Text(
+                          'Yerel ağ adresi bulunamadı.\n'
+                          'Wi-Fi\'ye bağlı olduğunuzdan emin olun.',
+                          textAlign: TextAlign.center,
+                        ),
+                        const SizedBox(height: 16),
+                        FilledButton.icon(
+                          onPressed: _start,
+                          icon: const Icon(Icons.refresh_rounded),
+                          label: const Text('Tekrar dene'),
+                        ),
+                      ],
                     ),
                   ),
                 )
@@ -179,14 +208,25 @@ class _LanScanScreenState extends State<LanScanScreen> {
                           style: theme.textTheme.bodySmall,
                         ),
                       ),
+                      const Padding(
+                        padding: EdgeInsets.symmetric(horizontal: 16),
+                        child: Text(
+                          'Bir cihaza dokunup protokol seçin; kayıt '
+                          'uzak listesine eklenir.',
+                          style: TextStyle(fontSize: 12),
+                        ),
+                      ),
                       if (_devices.isEmpty)
                         const Padding(
                           padding: EdgeInsets.all(32),
                           child: Center(
                             child: Text(
-                              'Paylaşım sunucusu bulunamadı.\n'
-                              'SMB/FTP/SFTP sunucunuzun açık olduğunu '
-                              'kontrol edin ve yenileyin.',
+                              'Paylaşım sunucusu bulunamadı.\n\n'
+                              '• Bilgisayarda dosya paylaşımı / Samba açık mı?\n'
+                              '• Telefon ile aynı Wi-Fi\'de misiniz?\n'
+                              '• Güvenlik duvarı 445/21/22 portlarını '
+                              'engelliyor olabilir.\n\n'
+                              'Aşağı kaydırarak yeniden tarayın.',
                               textAlign: TextAlign.center,
                             ),
                           ),
@@ -197,7 +237,35 @@ class _LanScanScreenState extends State<LanScanScreen> {
                               color: Color(0xFF00897B)),
                           title: Text(d.ip),
                           subtitle: Text(d.summary),
-                          trailing: const Icon(Icons.chevron_right_rounded),
+                          trailing: Wrap(
+                            spacing: 4,
+                            children: [
+                              if (d.hasSmb)
+                                const Chip(
+                                  label: Text('SMB'),
+                                  visualDensity: VisualDensity.compact,
+                                  padding: EdgeInsets.zero,
+                                ),
+                              if (d.hasFtp)
+                                const Chip(
+                                  label: Text('FTP'),
+                                  visualDensity: VisualDensity.compact,
+                                  padding: EdgeInsets.zero,
+                                ),
+                              if (d.hasSftp)
+                                const Chip(
+                                  label: Text('SFTP'),
+                                  visualDensity: VisualDensity.compact,
+                                  padding: EdgeInsets.zero,
+                                ),
+                              if (d.hasWebDav)
+                                const Chip(
+                                  label: Text('DAV'),
+                                  visualDensity: VisualDensity.compact,
+                                  padding: EdgeInsets.zero,
+                                ),
+                            ],
+                          ),
                           onTap: () => _deviceOptions(d),
                         ),
                     ],

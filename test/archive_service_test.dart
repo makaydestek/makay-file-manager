@@ -55,15 +55,18 @@ void main() {
   });
 
   group('isArchive / uzantılar', () {
-    test('desteklenen uzantılar arşiv sayılır, RAR/7z sayılmaz', () {
+    test('desteklenen uzantılar arşiv sayılır (ZIP/TAR/RAR/7Z/split)', () {
       expect(ArchiveService.isArchive('a.zip'), isTrue);
       expect(ArchiveService.isArchive('a.tar'), isTrue);
       expect(ArchiveService.isArchive('a.gz'), isTrue);
       expect(ArchiveService.isArchive('a.tgz'), isTrue);
       expect(ArchiveService.isArchive('a.tar.gz'), isTrue);
       expect(ArchiveService.isArchive('ARŞİV.ZIP'), isTrue);
-      expect(ArchiveService.isArchive('a.rar'), isFalse);
-      expect(ArchiveService.isArchive('a.7z'), isFalse);
+      // RAR/7z/ISO tarayıcıda arşiv menüsüne düşsün diye tanınır; açılışta
+      // dürüst "açılamaz" mesajı verilir.
+      expect(ArchiveService.isArchive('a.rar'), isTrue);
+      expect(ArchiveService.isArchive('a.7z'), isTrue);
+      expect(ArchiveService.isArchive('a.001'), isTrue);
       expect(ArchiveService.isArchive('a.txt'), isFalse);
       expect(ArchiveService.supportedExtensions, contains('.zip'));
       expect(ArchiveService.creatableExtensions, ['.zip', '.tar']);
@@ -73,7 +76,8 @@ void main() {
       expect(ArchiveService.formatName('x.zip'), 'ZIP');
       expect(ArchiveService.formatName('x.tar.gz'), 'TAR.GZ');
       expect(ArchiveService.formatName('x.tgz'), 'TAR.GZ');
-      expect(ArchiveService.formatName('x.rar'), isNull);
+      expect(ArchiveService.formatName('x.rar'), 'RAR');
+      expect(ArchiveService.formatName('x.7z'), '7Z');
     });
   });
 
@@ -153,11 +157,17 @@ void main() {
       );
     });
 
-    test('desteklenmeyen biçim (RAR) → Türkçe hata', () async {
+    test('RAR masaüstünde platform yok → Türkçe hata', () async {
+      // Android'de native junrar ile açılır; birim testleri Windows'ta
+      // platform kanalı olmadığı için dürüst hata verir.
+      final rar = File('${root.path}${sep}yedek.rar')
+        ..writeAsBytesSync(const [0x52, 0x61, 0x72, 0x21]); // "Rar!" imzası
       await expectLater(
-        svc.listEntries('${root.path}${sep}yedek.rar'),
+        svc.listEntries(rar.path),
         throwsA(isA<ArchiveServiceException>().having(
-            (e) => e.message, 'mesaj', contains('Desteklenmeyen'))),
+            (e) => e.message.toLowerCase(),
+            'mesaj',
+            anyOf(contains('android'), contains('açılamadı')))),
       );
     });
 

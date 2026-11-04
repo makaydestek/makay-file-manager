@@ -2,6 +2,7 @@ import 'package:flutter/material.dart';
 
 import '../services/platform_service.dart';
 import '../theme/app_theme.dart';
+import '../widgets/tv_focusable.dart';
 import 'browser_screen.dart';
 
 /// USB / SD kart ekranı: bağlı depolama birimlerini (OTG, SD kart, dahili
@@ -92,45 +93,60 @@ class _UsbStorageScreenState extends State<UsbStorageScreen> {
                           Text('Bağlı birimler',
                               style: theme.textTheme.titleSmall),
                           const SizedBox(height: 8),
-                          for (final volume in external)
-                            Card(
-                              child: ListTile(
-                                leading: Icon(
-                                  volume.isRemovable
-                                      ? Icons.sd_card_rounded
-                                      : Icons.storage_rounded,
-                                  color: AppTheme.accent,
-                                  size: 32,
+                          for (var i = 0; i < external.length; i++)
+                            Builder(builder: (context) {
+                              final volume = external[i];
+                              void open() {
+                                if (!volume.isMounted || volume.path.isEmpty) {
+                                  return;
+                                }
+                                Navigator.of(context).push(
+                                  MaterialPageRoute(
+                                    builder: (_) => BrowserScreen(
+                                      title: volume.description.isEmpty
+                                          ? 'USB / SD'
+                                          : volume.description,
+                                      rootPath: volume.path,
+                                    ),
+                                  ),
+                                );
+                              }
+
+                              return TvFocusable(
+                                autofocus: i == 0,
+                                onActivate: open,
+                                scale: 1.02,
+                                child: Card(
+                                  child: ListTile(
+                                    leading: Icon(
+                                      volume.isRemovable
+                                          ? Icons.sd_card_rounded
+                                          : Icons.storage_rounded,
+                                      color: AppTheme.accent,
+                                      size: 32,
+                                    ),
+                                    title: Text(volume.description.isEmpty
+                                        ? 'Depolama birimi'
+                                        : volume.description),
+                                    subtitle: Text(
+                                      volume.isMounted
+                                          ? (volume.path.isEmpty
+                                              ? 'Bağlı'
+                                              : volume.path)
+                                          : 'Bağlı değil (${volume.state})',
+                                      maxLines: 1,
+                                      overflow: TextOverflow.ellipsis,
+                                    ),
+                                    trailing: const Icon(
+                                        Icons.chevron_right_rounded),
+                                    onTap: !volume.isMounted ||
+                                            volume.path.isEmpty
+                                        ? null
+                                        : open,
+                                  ),
                                 ),
-                                title: Text(volume.description.isEmpty
-                                    ? 'Depolama birimi'
-                                    : volume.description),
-                                subtitle: Text(
-                                  volume.isMounted
-                                      ? (volume.path.isEmpty
-                                          ? 'Bağlı'
-                                          : volume.path)
-                                      : 'Bağlı değil (${volume.state})',
-                                  maxLines: 1,
-                                  overflow: TextOverflow.ellipsis,
-                                ),
-                                trailing:
-                                    const Icon(Icons.chevron_right_rounded),
-                                onTap: !volume.isMounted ||
-                                        volume.path.isEmpty
-                                    ? null
-                                    : () => Navigator.of(context).push(
-                                          MaterialPageRoute(
-                                            builder: (_) => BrowserScreen(
-                                              title: volume.description.isEmpty
-                                                  ? 'USB / SD'
-                                                  : volume.description,
-                                              rootPath: volume.path,
-                                            ),
-                                          ),
-                                        ),
-                              ),
-                            ),
+                              );
+                            }),
                         ],
                       ),
                     ),

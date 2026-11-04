@@ -3,6 +3,7 @@ import 'package:flutter_test/flutter_test.dart';
 import 'package:provider/provider.dart';
 import 'package:shared_preferences/shared_preferences.dart';
 
+import 'package:makay_file_manager/models/home_category.dart';
 import 'package:makay_file_manager/providers/settings_provider.dart';
 import 'package:makay_file_manager/screens/home_categories_screen.dart';
 import 'package:makay_file_manager/screens/home_screen.dart';
@@ -86,9 +87,7 @@ void main() {
       (tester) async {
     final settings = await pumpHome(tester);
     for (final id in [
-      'internal', 'downloads', 'analysis', 'images', 'audio', 'videos',
-      'documents', 'apps', 'recent', 'remote', 'vault', 'usb',
-      'network',
+      for (final c in kHomeCategories) c.id,
     ]) {
       settings.setCategoryVisible(id, false);
     }
@@ -124,8 +123,11 @@ void main() {
     await tester.pumpAndSettle();
     expect(find.text('Bulut'), findsNothing);
 
-    // Rota/ekran kodu duruyor: geri eklemek tek satır.
-    expect(find.text('Kasa'), findsOneWidget);
+    // Rota/ekran kodu duruyor: geri eklemek tek satır. Modelde cloud yok,
+    // kasa/temizlik kartları listede.
+    expect(kHomeCategories.any((c) => c.id == 'cloud'), isFalse);
+    expect(kHomeCategories.any((c) => c.id == 'vault'), isTrue);
+    expect(kHomeCategories.any((c) => c.id == 'clean'), isTrue);
   });
 
   testWidgets('Tümünü göster sıfırlama düğmesi gizlenenleri geri getirir',

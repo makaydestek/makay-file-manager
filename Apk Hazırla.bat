@@ -114,10 +114,16 @@ for %%F in ("APK\MakayFileManager-*-mapping.txt") do (
 
 echo.
 echo [4/5] Kod deposuna yukleniyor (git)...
+if not exist "%~dp0tool\git_commit.cmd" (
+  echo [HATA] tool\git_commit.cmd yok - yayin kimligi kurulamadi.
+  pause
+  exit /b 1
+)
+call "%~dp0tool\git_identity.cmd"
 git add "version.properties" "pubspec.yaml" >nul
 git diff --cached --quiet >nul 2>&1
 if errorlevel 1 (
-  git commit -m "Yayin: MakayFileManager v%VER%"
+  call "%~dp0tool\git_commit.cmd" -m "Yayin: MakayFileManager v%VER%"
   if errorlevel 1 (
     echo [HATA] Git commit basarisiz.
     pause

@@ -62,6 +62,13 @@ const List<HomeCategory> kHomeCategories = [
     route: '/analysis',
   ),
   HomeCategory(
+    id: 'clean',
+    title: 'Temizlik',
+    icon: Icons.cleaning_services_rounded,
+    color: Color(0xFF00897B),
+    route: '/clean',
+  ),
+  HomeCategory(
     id: 'images',
     title: 'Resimler',
     icon: Icons.image_rounded,

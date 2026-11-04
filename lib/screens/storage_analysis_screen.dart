@@ -7,6 +7,7 @@ import '../utils/formats.dart';
 import '../utils/text_utils.dart';
 import '../widgets/app_drawer.dart';
 import '../widgets/app_icon.dart';
+import '../widgets/pie_chart.dart';
 import 'apps_screen.dart';
 import 'large_files_screen.dart';
 
@@ -53,34 +54,125 @@ class _StorageAnalysisScreenState extends State<StorageAnalysisScreen> {
   List<FileEntry> _largeFiles = [];
   int _largeTotal = 0;
   int _cache = 0;
-  bool _loading = true;
+
+  /// İlk kartlar (depolama) gelene kadar tam spinner; sonra kartlar
+  /// progressive dolar (büyük dosya / önbellek arka planda).
+  bool _bootLoading = true;
+  bool _breakdownLoading = true;
+  bool _appsLoading = true;
+  bool _largeLoading = true;
+  bool _cacheLoading = true;
+
+  /// Kısa ömürlü bellek önbelleği: aynı oturumda sayfa yeniden açılınca
+  /// anında gösterilir, arka planda yenilenir.
+  static DateTime? _cacheAt;
+  static ({int total, int free})? _cachedStorage;
+  static Map<String, int>? _cachedBreakdown;
+  static List<InstalledApp>? _cachedTopApps;
+  static int? _cachedAppsTotal;
+  static List<FileEntry>? _cachedLarge;
+  static int? _cachedLargeTotal;
+  static int? _cachedCacheBytes;
+  static const _cacheTtl = Duration(minutes: 3);
 
   @override
   void initState() {
     super.initState();
+    _hydrateFromCache();
     _load();
   }
 
-  Future<void> _load() async {
-    setState(() => _loading = true);
-    final storage = await PlatformService.storageInfo();
-    final breakdown = await _analysis.categoryBreakdown();
-    final apps = await PlatformService.installedApps();
-    final large = await _analysis.largeFiles(limit: kLargeSample);
-    final cache = await _analysis.cacheSize();
+  void _hydrateFromCache() {
+    final at = _cacheAt;
+    if (at == null || DateTime.now().difference(at) > _cacheTtl) return;
+    _storage = _cachedStorage;
+    _breakdown = _cachedBreakdown ?? {};
+    _topApps = _cachedTopApps ?? const [];
+    _appsTotalSize = _cachedAppsTotal ?? 0;
+    _largeFiles = _cachedLarge ?? const [];
+    _largeTotal = _cachedLargeTotal ?? 0;
+    _cache = _cachedCacheBytes ?? 0;
+    _bootLoading = _storage == null;
+    _breakdownLoading = _cachedBreakdown == null;
+    _appsLoading = _cachedTopApps == null;
+    _largeLoading = _cachedLarge == null;
+    _cacheLoading = _cachedCacheBytes == null;
+  }
 
-    apps.sort((a, b) => b.size.compareTo(a.size));
+  Future<void> _load({bool force = false}) async {
+    if (force) {
+      _cacheAt = null;
+      if (mounted) {
+        setState(() {
+          _bootLoading = true;
+          _breakdownLoading = true;
+          _appsLoading = true;
+          _largeLoading = true;
+          _cacheLoading = true;
+        });
+      }
+    }
+
+    // 1) Depolama bilgisi — en hızlı; ekranı hemen açar.
+    final storage = await PlatformService.storageInfo();
     if (!mounted) return;
     setState(() {
       _storage = storage;
-      _breakdown = breakdown;
-      _topApps = apps.take(2).toList();
-      _appsTotalSize = apps.fold(0, (s, a) => s + (a.size > 0 ? a.size : 0));
-      _largeFiles = large.take(2).toList();
-      _largeTotal = large.fold(0, (s, f) => s + f.size);
-      _cache = cache;
-      _loading = false;
+      _bootLoading = false;
     });
+
+    // 2) Kırılım + uygulamalar paralel (birbirine bağımlı değil).
+    final breakdownFuture = _analysis.categoryBreakdown();
+    final appsFuture = PlatformService.installedApps();
+
+    // Büyük dosya / önbellek daha ağır — ayrı arka plan görevleri.
+    final largeFuture = _analysis.largeFiles(limit: kLargeSample);
+    final cacheFuture = _analysis.cacheSize();
+
+    await Future.wait([
+      breakdownFuture.then((breakdown) {
+        if (!mounted) return;
+        setState(() {
+          _breakdown = breakdown;
+          _breakdownLoading = false;
+        });
+      }),
+      appsFuture.then((apps) {
+        apps.sort((a, b) => b.size.compareTo(a.size));
+        if (!mounted) return;
+        setState(() {
+          _topApps = apps.take(2).toList();
+          _appsTotalSize =
+              apps.fold(0, (s, a) => s + (a.size > 0 ? a.size : 0));
+          _appsLoading = false;
+        });
+      }),
+      largeFuture.then((large) {
+        if (!mounted) return;
+        setState(() {
+          _largeFiles = large.take(2).toList();
+          _largeTotal = large.fold(0, (s, f) => s + f.size);
+          _largeLoading = false;
+        });
+      }),
+      cacheFuture.then((cache) {
+        if (!mounted) return;
+        setState(() {
+          _cache = cache;
+          _cacheLoading = false;
+        });
+      }),
+    ]);
+
+    if (!mounted) return;
+    _cacheAt = DateTime.now();
+    _cachedStorage = _storage;
+    _cachedBreakdown = Map.of(_breakdown);
+    _cachedTopApps = List.of(_topApps);
+    _cachedAppsTotal = _appsTotalSize;
+    _cachedLarge = List.of(_largeFiles);
+    _cachedLargeTotal = _largeTotal;
+    _cachedCacheBytes = _cache;
   }
 
   @override
@@ -102,7 +194,7 @@ class _StorageAnalysisScreenState extends State<StorageAnalysisScreen> {
             onSelected: (value) {
               switch (value) {
                 case 'refresh':
-                  _load();
+                  _load(force: true);
                 case 'settings':
                   Navigator.of(context).pushNamed('/settings');
               }
@@ -115,8 +207,8 @@ class _StorageAnalysisScreenState extends State<StorageAnalysisScreen> {
         ],
       ),
       body: RefreshIndicator(
-        onRefresh: _load,
-        child: _loading
+        onRefresh: () => _load(force: true),
+        child: _bootLoading
             ? const Center(child: CircularProgressIndicator())
             : ListView(
                 padding: const EdgeInsets.all(12),
@@ -176,7 +268,16 @@ class _StorageAnalysisScreenState extends State<StorageAnalysisScreen> {
               ),
             ),
             const SizedBox(height: 16),
-            _breakdownGrid(theme),
+            if (_breakdownLoading)
+              const Padding(
+                padding: EdgeInsets.symmetric(vertical: 24),
+                child: Center(child: CircularProgressIndicator()),
+              )
+            else ...[
+              _pieSection(theme),
+              const SizedBox(height: 12),
+              _breakdownGrid(theme),
+            ],
             const Divider(height: 24),
             _moreButton(context, 'DAHA FAZLA', () {
               Navigator.of(context).push(
@@ -188,6 +289,45 @@ class _StorageAnalysisScreenState extends State<StorageAnalysisScreen> {
           ],
         ),
       ),
+    );
+  }
+
+  /// Pasta grafik (CX tarzı renkli depolama özeti).
+  Widget _pieSection(ThemeData theme) {
+    const colors = <String, Color>{
+      'Resimler': Color(0xFF8E24AA),
+      'Videolar': Color(0xFFD32F2F),
+      'Ses': Color(0xFF00897B),
+      'Belgeler': Color(0xFF1976D2),
+      'Arşivler': Color(0xFF6D4C41),
+      'Diğerleri': Color(0xFF757575),
+    };
+    final slices = <PieSlice>[
+      for (final k in _kBreakdownOrder)
+        if ((_breakdown[k] ?? 0) > 0)
+          PieSlice(
+            label: _label(k),
+            bytes: _breakdown[k]!,
+            color: colors[k] ?? Colors.grey,
+          ),
+    ];
+    if (slices.isEmpty) return const SizedBox.shrink();
+    return Column(
+      crossAxisAlignment: CrossAxisAlignment.start,
+      children: [
+        Text('Dağılım grafiği', style: theme.textTheme.titleMedium),
+        const SizedBox(height: 8),
+        CategoryPieChart(slices: slices),
+        const SizedBox(height: 8),
+        Align(
+          alignment: Alignment.centerRight,
+          child: TextButton.icon(
+            onPressed: () => Navigator.of(context).pushNamed('/clean'),
+            icon: const Icon(Icons.cleaning_services_rounded, size: 18),
+            label: const Text('Temizlik merkezi'),
+          ),
+        ),
+      ],
     );
   }
 
@@ -269,16 +409,22 @@ class _StorageAnalysisScreenState extends State<StorageAnalysisScreen> {
               ],
             ),
             const SizedBox(height: 8),
-            for (final app in _topApps)
-              ListTile(
-                contentPadding: EdgeInsets.zero,
-                leading: AppIcon(app, size: 32),
-                title: Text(app.name),
-                trailing: Text(
-                  app.size > 0 ? Formats.size(app.size) : '—',
-                  style: TextStyle(color: theme.colorScheme.primary),
+            if (_appsLoading)
+              const Padding(
+                padding: EdgeInsets.symmetric(vertical: 16),
+                child: Center(child: CircularProgressIndicator()),
+              )
+            else
+              for (final app in _topApps)
+                ListTile(
+                  contentPadding: EdgeInsets.zero,
+                  leading: AppIcon(app, size: 32),
+                  title: Text(app.name),
+                  trailing: Text(
+                    app.size > 0 ? Formats.size(app.size) : '—',
+                    style: TextStyle(color: theme.colorScheme.primary),
+                  ),
                 ),
-              ),
             const Divider(height: 16),
             _moreButton(context, 'DAHA FAZLA', () {
               Navigator.of(context).push(
@@ -303,12 +449,18 @@ class _StorageAnalysisScreenState extends State<StorageAnalysisScreen> {
               mainAxisAlignment: MainAxisAlignment.spaceBetween,
               children: [
                 Text('Büyük dosyalar', style: theme.textTheme.titleLarge),
-                Text(
-                  Formats.size(_largeTotal),
-                  style: theme.textTheme.titleMedium?.copyWith(
-                      color: theme.colorScheme.primary,
-                      fontWeight: FontWeight.bold),
-                ),
+                _largeLoading
+                    ? const SizedBox(
+                        width: 18,
+                        height: 18,
+                        child: CircularProgressIndicator(strokeWidth: 2),
+                      )
+                    : Text(
+                        Formats.size(_largeTotal),
+                        style: theme.textTheme.titleMedium?.copyWith(
+                            color: theme.colorScheme.primary,
+                            fontWeight: FontWeight.bold),
+                      ),
               ],
             ),
             const SizedBox(height: 4),
@@ -317,18 +469,24 @@ class _StorageAnalysisScreenState extends State<StorageAnalysisScreen> {
                 style: theme.textTheme.bodySmall
                     ?.copyWith(color: theme.colorScheme.outline)),
             const SizedBox(height: 8),
-            for (final f in _largeFiles)
-              ListTile(
-                contentPadding: EdgeInsets.zero,
-                leading: Icon(f.icon, color: f.color),
-                title: Text(f.name,
-                    maxLines: 1, overflow: TextOverflow.ellipsis),
-                subtitle: Text(f.path
-                    .replaceAll('/storage/emulated/0', '')
-                    .ifEmpty('/')),
-                trailing: Text(Formats.size(f.size),
-                    style: TextStyle(color: theme.colorScheme.primary)),
-              ),
+            if (_largeLoading)
+              const Padding(
+                padding: EdgeInsets.symmetric(vertical: 16),
+                child: Center(child: CircularProgressIndicator()),
+              )
+            else
+              for (final f in _largeFiles)
+                ListTile(
+                  contentPadding: EdgeInsets.zero,
+                  leading: Icon(f.icon, color: f.color),
+                  title: Text(f.name,
+                      maxLines: 1, overflow: TextOverflow.ellipsis),
+                  subtitle: Text(f.path
+                      .replaceAll('/storage/emulated/0', '')
+                      .ifEmpty('/')),
+                  trailing: Text(Formats.size(f.size),
+                      style: TextStyle(color: theme.colorScheme.primary)),
+                ),
             const Divider(height: 16),
             _moreButton(context, 'DAHA FAZLA', () {
               Navigator.of(context).push(
@@ -354,12 +512,18 @@ class _StorageAnalysisScreenState extends State<StorageAnalysisScreen> {
               children: [
                 Text('Ön bellek dosyaları',
                     style: theme.textTheme.titleLarge),
-                Text(
-                  Formats.size(_cache),
-                  style: theme.textTheme.titleMedium?.copyWith(
-                      color: theme.colorScheme.primary,
-                      fontWeight: FontWeight.bold),
-                ),
+                _cacheLoading
+                    ? const SizedBox(
+                        width: 18,
+                        height: 18,
+                        child: CircularProgressIndicator(strokeWidth: 2),
+                      )
+                    : Text(
+                        Formats.size(_cache),
+                        style: theme.textTheme.titleMedium?.copyWith(
+                            color: theme.colorScheme.primary,
+                            fontWeight: FontWeight.bold),
+                      ),
               ],
             ),
             const SizedBox(height: 4),

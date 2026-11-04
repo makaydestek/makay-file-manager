@@ -2,10 +2,13 @@ import 'dart:io';
 
 import 'package:flutter/material.dart';
 
+import '../services/heavy_scan.dart';
 import '../services/platform_service.dart';
 import '../utils/formats.dart';
 import '../widgets/apk_install_dialog.dart';
+import '../widgets/app_drawer.dart';
 import '../widgets/app_icon.dart';
+import '../widgets/tv_focusable.dart';
 
 /// Uygulamalar ekranı: Tümü / İndirilenler (APK'lar) / Dahili (sistem).
 ///
@@ -63,7 +66,7 @@ class _AppsScreenState extends State<AppsScreen>
     // `installedApps` hata/desteklenmeyen durumda `const []` döndürür;
     // sabit liste `sort` ile değiştirilemediği için MUTLAKA kopyalanır.
     final apps = List<InstalledApp>.of(await PlatformService.installedApps());
-    final apks = _downloadedApks();
+    final apks = await _downloadedApks();
     final usage = await PlatformService.hasUsageAccess();
     apps.sort((a, b) =>
         _sortDesc ? b.size.compareTo(a.size) : a.size.compareTo(b.size));
@@ -77,17 +80,11 @@ class _AppsScreenState extends State<AppsScreen>
   }
 
   /// Download klasöründeki APK dosyaları ("İndirilenler" sekmesi).
-  List<File> _downloadedApks() {
+  Future<List<File>> _downloadedApks() async {
     if (!Platform.isAndroid) return const [];
-    final dir = Directory('/storage/emulated/0/Download');
-    if (!dir.existsSync()) return const [];
     try {
-      return dir
-          .listSync(followLinks: false)
-          .whereType<File>()
-          .where((f) => f.path.toLowerCase().endsWith('.apk'))
-          .toList()
-        ..sort((a, b) => b.statSync().modified.compareTo(a.statSync().modified));
+      final paths = await HeavyScan.downloadApkPaths();
+      return [for (final p in paths) File(p)];
     } catch (_) {
       return const [];
     }
@@ -96,6 +93,7 @@ class _AppsScreenState extends State<AppsScreen>
   @override
   Widget build(BuildContext context) {
     return Scaffold(
+      drawer: const AppDrawer(),
       appBar: AppBar(
         title: const Text('Uygulamalar'),
         actions: [
@@ -203,6 +201,11 @@ class _AppsScreenState extends State<AppsScreen>
   }
 
   /// Kullanım erişimi izni için adım adım rehber.
+  ///
+  /// Sideload + Android 13+: anahtar "Kısıtlanmış ayar tarafından
+  /// kontrol ediliyor" diye gri kalır. Önce Uygulama bilgisi → ⋮ →
+  /// "Kısıtlı ayarlara izin ver" şarttır; sonra kullanım erişimi açılır.
+  /// Play Store dışı kurulumlarda bu sistem kısıtı uygulamadan kaldırılamaz.
   void _showUsageGuide() {
     // pop sonrası geri bildirim için messenger'ı önceden al.
     final messenger = ScaffoldMessenger.of(context);
@@ -210,35 +213,47 @@ class _AppsScreenState extends State<AppsScreen>
       context: context,
       builder: (context) => AlertDialog(
         title: const Text('Kullanım erişimi izni'),
-        content: const Column(
-          mainAxisSize: MainAxisSize.min,
-          crossAxisAlignment: CrossAxisAlignment.start,
-          children: [
-            Text('Boyutların tam (uygulama + veri) gösterilebilmesi için '
-                'aşağıdaki adımları izleyin:'),
-            SizedBox(height: 12),
-            Text('1. "Kullanım erişimi" listesini açın.'),
-            Text('2. Listeden "Makay Dosya Yöneticisi"ni bulup seçin.'),
-            Text('3. Anahtarı açıp izni verin, sonra uygulamaya dönün.'),
-            SizedBox(height: 12),
-            Text(
-              '"Erişim reddedildi" çıkarsa (MIUI / Android 13+ kısıtlı '
-              'ayarlar): "Uygulama bilgisini aç" deyin, sağ üstteki ⋮ '
-              'menüsünden "Kısıtlı ayarlara izin ver" seçeneğini açın ve '
-              '1-3. adımları tekrarlayın. Bu menü yoksa (MIUI): Ayarlar → '
-              'Uygulamalar → Makay Dosya Yöneticisi → İzinlar altında '
-              '"Kullanım erişimi / Uygulama kullanım verileri" anahtarını '
-              'açın.',
-              style: TextStyle(fontSize: 12),
-            ),
-          ],
+        content: const SingleChildScrollView(
+          child: Column(
+            mainAxisSize: MainAxisSize.min,
+            crossAxisAlignment: CrossAxisAlignment.start,
+            children: [
+              Text(
+                'Tam boyut (uygulama + veri) için kullanım erişimi gerekir. '
+                'Anahtar gri / "kısıtlanmış ayar" yazıyorsa önce Adım 1 '
+                'zorunludur — aksi halde anahtar açılmaz.',
+              ),
+              SizedBox(height: 12),
+              Text(
+                'Adım 1 — Kısıtlı ayarlara izin ver',
+                style: TextStyle(fontWeight: FontWeight.bold),
+              ),
+              Text(
+                '• "Uygulama bilgisini aç" deyin\n'
+                '• Sağ üst ⋮ menüsünden "Kısıtlı ayarlara izin ver"\n'
+                '• İstenirse kilit / biyometri ile onaylayın\n'
+                '• Menü yoksa (bazı MIUI): İzinler → Kullanım erişimi',
+              ),
+              SizedBox(height: 12),
+              Text(
+                'Adım 2 — Kullanım erişimini aç',
+                style: TextStyle(fontWeight: FontWeight.bold),
+              ),
+              Text(
+                '• "Kullanım erişimi" deyin\n'
+                '• "Uygulama kullanım verilerine erişim izin ver" anahtarını açın\n'
+                '• Uygulamaya dönün — boyutlar yenilenir',
+              ),
+            ],
+          ),
         ),
         actions: [
           TextButton(
             onPressed: () => Navigator.pop(context),
             child: const Text('İptal'),
           ),
-          TextButton(
+          // Birincil CTA: kısıtlı ayar kilidini kaldırmak (Android 13+).
+          FilledButton(
             onPressed: () async {
               Navigator.pop(context);
               final ok = await PlatformService.openAppSettings();
@@ -248,11 +263,18 @@ class _AppsScreenState extends State<AppsScreen>
                       'Sayfa açılamadı — Ayarlar → Uygulamalar → Makay '
                       'Dosya Yöneticisi yolunu elle izleyin.'),
                 ));
+              } else {
+                messenger.showSnackBar(const SnackBar(
+                  content: Text(
+                      '⋮ menüsünden "Kısıtlı ayarlara izin ver" deyin, '
+                      'sonra tekrar "Kullanım erişimi"ne dönün.'),
+                  duration: Duration(seconds: 6),
+                ));
               }
             },
-            child: const Text('Uygulama bilgisini aç'),
+            child: const Text('1. Uygulama bilgisini aç'),
           ),
-          FilledButton(
+          TextButton(
             onPressed: () async {
               Navigator.pop(context);
               final ok = await PlatformService.openUsageAccessSettings();
@@ -264,7 +286,7 @@ class _AppsScreenState extends State<AppsScreen>
                 ));
               }
             },
-            child: const Text('Kullanım erişimi'),
+            child: const Text('2. Kullanım erişimi'),
           ),
         ],
       ),
@@ -284,13 +306,18 @@ class _AppsScreenState extends State<AppsScreen>
             ? file.path.split(Platform.pathSeparator).last
             : file.uri.pathSegments[file.uri.pathSegments.length - 1];
         final size = file.lengthSync();
-        return ListTile(
-          leading:
-              const Icon(Icons.android_rounded, color: Color(0xFF43A047)),
-          title: Text(name, maxLines: 1, overflow: TextOverflow.ellipsis),
-          subtitle: Text(Formats.size(size)),
-          // APK'ya dokununca bilgi yerine Kur/Güncelle ekranı açılır.
-          onTap: () => showApkInstallDialog(context, file),
+        return TvFocusable(
+          autofocus: index == 0,
+          onActivate: () => showApkInstallDialog(context, file),
+          scale: 1.02,
+          child: ListTile(
+            leading:
+                const Icon(Icons.android_rounded, color: Color(0xFF43A047)),
+            title: Text(name, maxLines: 1, overflow: TextOverflow.ellipsis),
+            subtitle: Text(Formats.size(size)),
+            // APK'ya dokununca bilgi yerine Kur/Güncelle ekranı açılır.
+            onTap: () => showApkInstallDialog(context, file),
+          ),
         );
       },
     );
@@ -312,25 +339,30 @@ class _AppsScreenState extends State<AppsScreen>
       itemCount: visibleApps.length,
       itemBuilder: (context, index) {
         final app = visibleApps[index];
-        return ListTile(
-          leading: AppIcon(app),
-          title: Text(app.name, maxLines: 1, overflow: TextOverflow.ellipsis),
-          subtitle: Text(app.packageName),
-          trailing: Column(
-            mainAxisAlignment: MainAxisAlignment.center,
-            crossAxisAlignment: CrossAxisAlignment.end,
-            children: [
-              Text(
-                app.size > 0 ? Formats.size(app.size) : '—',
-                style:
-                    TextStyle(color: Theme.of(context).colorScheme.primary),
-              ),
-              if (app.versionName.isNotEmpty)
-                Text(app.versionName,
-                    style: Theme.of(context).textTheme.bodySmall),
-            ],
+        return TvFocusable(
+          autofocus: index == 0,
+          onActivate: () => _appActions(app),
+          scale: 1.02,
+          child: ListTile(
+            leading: AppIcon(app),
+            title: Text(app.name, maxLines: 1, overflow: TextOverflow.ellipsis),
+            subtitle: Text(app.packageName),
+            trailing: Column(
+              mainAxisAlignment: MainAxisAlignment.center,
+              crossAxisAlignment: CrossAxisAlignment.end,
+              children: [
+                Text(
+                  app.size > 0 ? Formats.size(app.size) : '—',
+                  style:
+                      TextStyle(color: Theme.of(context).colorScheme.primary),
+                ),
+                if (app.versionName.isNotEmpty)
+                  Text(app.versionName,
+                      style: Theme.of(context).textTheme.bodySmall),
+              ],
+            ),
+            onTap: () => _appActions(app),
           ),
-          onTap: () => _appActions(app),
         );
       },
     );

@@ -152,8 +152,39 @@ void main() {
     await c.send('PWD');
     expect(await c.readReply(), contains('"/yeni"'));
 
+    // İç içe göreli CWD (Windows Explorer her klasörde bunu yapar).
+    await c.send('MKD alt');
+    expect(await c.readReply(), startsWith('257'));
+    await c.send('CWD alt');
+    expect(await c.readReply(), startsWith('250'));
+    await c.send('PWD');
+    expect(await c.readReply(), contains('"/yeni/alt"'));
+
     await c.send('QUIT');
     expect(await c.readReply(), startsWith('221'));
+    await c.close();
+  });
+
+  test('EPSV veri bağlantısı kurulur', () async {
+    final c = await _FtpTestClient.connect(port);
+    await c.readReply();
+    await c.send('USER android');
+    await c.readReply();
+    await c.send('PASS sifre123');
+    expect(await c.readReply(), startsWith('230'));
+
+    await c.send('EPSV');
+    final epsv = await c.readReply();
+    expect(epsv, startsWith('229'));
+    final match = RegExp(r'\|\|\|(\d+)\|').firstMatch(epsv)!;
+    final dataPort = int.parse(match.group(1)!);
+    final data = await Socket.connect(InternetAddress.loopbackIPv4, dataPort);
+    await c.send('NLST');
+    expect(await c.readReply(), startsWith('150'));
+    final listing = await utf8.decoder.bind(data).join();
+    expect(listing, contains('hello.txt'));
+    expect(await c.readReply(), startsWith('226'));
+    await c.send('QUIT');
     await c.close();
   });
 }

@@ -290,8 +290,19 @@ class FileService {
         onProgress: onProgress,
         cancelToken: cancelToken,
       );
-      await deleteEntry(source, useRecycleBin: false);
-      return result;
+      if (result.cancelled) return result;
+      try {
+        await deleteEntry(source, useRecycleBin: false);
+        return result;
+      } catch (e) {
+        return TransferResult(
+          files: result.files,
+          bytes: result.bytes,
+          cancelled: false,
+          warning:
+              'Hedefe kopyalandı ancak kaynak silinemedi — çift kopya olabilir. ($e)',
+        );
+      }
     } finally {
       await CategorySizeService.invalidate();
     }
