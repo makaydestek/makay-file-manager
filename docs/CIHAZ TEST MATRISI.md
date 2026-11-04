@@ -186,7 +186,7 @@ ayrıca doldurulur; bu liste kararlılık regresyonunu hızlı yakalar.
 
 | Sürüm | Tarih | Cihazlar | Sonuç | Notlar |
 |---|---|---|---|---|
-| 1.0.43+ | 2026-11-04 | — | ⏳ Bekliyor | A28 güvenlik + MKC1 kasa + tarayıcı parçalama sonrası smoke S1–S9 (en az C3) doldurulacak |
+| 1.0.43+ | 2026-11-04 | — | ⏳ Manuel | Kod/depo hazır (A28–A29b). Yayın öncesi **yalnızca** smoke S1–S9 gerçek cihazda (en az C3) işaretlenecek — otomasyon dışı tek açık kapı |
 | 1.0.31 | 2026-10-20 | — | ⏳ Bekliyor | Kararlılık sertleştirme (SHA zorunlu, izolat, kasa, arşiv iptal); smoke S1–S9 doldurulacak |
 | 1.0.10 | 2026-10-11 | C3 (emülatör) | ⚠️ Kısmi | Yalnızca otomatik testler koşuldu; cihaz matrisi bu sürümden itibaren uygulanacak |
 

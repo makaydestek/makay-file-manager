@@ -62,6 +62,12 @@ APK/
 # Widget Preview related
 .widget_preview/
 
+# Yerel derleme / test dökümleri (Apk Hazırla.bat, flutter test yönlendirmeleri)
+bat_output.txt
+build_output.txt
+test_output.txt
+*_output.txt
+
 # --- E2E (integration_test) bilinçli olarak KALDIRILDI ---
 # Kullanıcı kararı: uçtan uca test katmanı bu projede YOK ve bir daha
 # eklenmeyecek. Bu klasör buraya eklenirse git'e girmez; ayrıca CI'daki
