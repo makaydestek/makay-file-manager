@@ -766,5 +766,16 @@ zemin).
   izni gerekir — Play Store'da kısıtlı, APK yan yüklemeye uygun.
 - Medya okuma için Android 13+ `READ_MEDIA_IMAGES/VIDEO/AUDIO` izinleri A3'te eklenecek.
 - TV platformu ayrı build değil, aynı APK'ya leanback destek + banner eklenir.
-- **Bekleyen**: `browser_screen` parçalama, tam TV odak turu, i18n,
-  kasa akışlı şifreleme (>64 MB), cihaz matrisi hücrelerinin doldurulması.
+### A29 — Sürdürülebilirlik ve Kalan P1/P2 ✅
+- [x] **browser_screen parçalama**: `browser_file_actions` / `browser_row_menu`
+      / `browser_body` (~1800 → ~700 + parçalar).
+- [x] **TV odak**: arşiv listesi + TÜMÜNÜ ÇIKAR; kasa kilit ekranı;
+      tarayıcı satırları (önceden vardı).
+- [x] **Kasa MKC1**: >4 MB dosyalar 1 MB parçalı AES-GCM; tavan 512 MB;
+      PIN değişiminde parçalı yeniden şifreleme.
+- [x] **Bulut UX**: Ayarlar → "Bulut bağlantıları" (uyarı diyaloğu + `/cloud`).
+- [x] **i18n iskeleti**: `l10n.yaml` + `app_tr.arb` / `app_en.arb` +
+      `AppLocalizations` (başlıklar); varsayılan locale hâlâ `tr`.
+- [x] **photo_manager**: 3.12.0 hâlâ güncel; 3.12.1+ bekleniyor (A26).
+
+- **Bekleyen (manuel)**: cihaz matrisi hücrelerinin doldurulması (smoke S1–S9).

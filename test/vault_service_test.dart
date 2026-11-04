@@ -211,6 +211,40 @@ void main() {
     expect(out.readAsStringSync(), content);
   }, timeout: const Timeout(Duration(seconds: 60)));
 
+  test('maxAddBytes üstü dosya kasaya eklenemez', () async {
+    VaultService.debugMaxAddBytes = 64;
+    addTearDown(() => VaultService.debugMaxAddBytes = null);
+    await VaultService.create('121212');
+    final over = File('${outside.path}${Platform.pathSeparator}over.bin');
+    await over.writeAsBytes(List<int>.filled(128, 7));
+    await expectLater(
+      VaultService.add(over),
+      throwsA(isA<StateError>()),
+    );
+    final small = makeSource('ok.txt', 'kucuk');
+    final entry = await VaultService.add(small);
+    expect(entry.name, 'ok.txt');
+  }, timeout: const Timeout(Duration(seconds: 60)));
+
+  test('MKC1 parçalı biçim: ekle → listele → dışa aktar birebir', () async {
+    // Eşiği düşürerek küçük dosyayla MKC1 yolunu sınarız.
+    VaultService.debugChunkedThresholdBytes = 8;
+    addTearDown(() => VaultService.debugChunkedThresholdBytes = null);
+    await VaultService.create('343434');
+    final payload = List<int>.generate(3000, (i) => i & 0xff);
+    final source = File('${outside.path}${Platform.pathSeparator}chunk.bin')
+      ..writeAsBytesSync(payload);
+    final entry = await VaultService.add(source);
+    expect(entry.size, payload.length);
+
+    final listed = await VaultService.list();
+    expect(listed.single.name, 'chunk.bin');
+    expect(listed.single.size, payload.length);
+
+    final out = await VaultService.exportTo(entry.id, outside.path);
+    expect(out.readAsBytesSync(), payload);
+  }, timeout: const Timeout(Duration(seconds: 90)));
+
   test('reset sonrası isConfigured false ve kasa dizini silinir', () async {
     await VaultService.create('555555');
     await VaultService.add(makeSource('kayip.txt', 'zzz'));

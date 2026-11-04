@@ -1,7 +1,7 @@
 import 'dart:convert';
 import 'dart:io';
+import 'dart:isolate';
 import 'dart:math';
-
 import 'package:flutter/foundation.dart';
 import 'package:path_provider/path_provider.dart';
 import 'package:pointycastle/export.dart';
@@ -45,13 +45,22 @@ class VaultEntry {
 /// * Çevrimiçi denemeleri yavaşlatmak için üstel geri çekilmeli
 ///   (backoff) kilitlenme uygulanır (bkz. [lockoutBackoffSeconds]).
 ///
-/// Dosya biçimi: 12 bayt nonce + AES-GCM şifreli içerik + 16 bayt MAC etiketi
-/// (pointycastle GCM çıktısı içerik+etiketi birleştirir).
+/// Dosya biçimleri:
+/// * **v1 (küçük dosya):** tek AES-GCM bloğu (nonce + şifre + etiket).
+/// * **v2 / MKC1 (büyük dosya):** `MKC1` sihirli baytları + şifreli başlık +
+///   1 MB'lık parça parça AES-GCM. Belleğe tüm dosyayı yüklemeden ekleme/
+///   dışa aktarma yapılabilir.
 class VaultService {
   VaultService._();
 
   static const String _prefsKey = 'vault_meta';
   static const int _formatVersion = 1;
+
+  /// Parçalı (MKC1) biçim sihirli baytları.
+  static const List<int> _mkc1Magic = [0x4d, 0x4b, 0x43, 0x31];
+
+  /// MKC1 düz metin parça boyutu.
+  static const int _plainChunkBytes = 1024 * 1024;
 
   /// Hatalı deneme/kilitlenme kaydının [SharedPreferences] anahtarı.
   static const String _lockoutKey = 'vault_lockout';
@@ -76,6 +85,28 @@ class VaultService {
   static const int pinMinLength = 6;
   static const int pinMaxLength = 12;
 
+  /// Kasaya eklenebilecek tek dosya üst boyutu.
+  ///
+  /// MKC1 parçalı şifreleme sayesinde 64 MB üstü dosyalar da eklenir;
+  /// tavan 512 MB (PIN değiştirmede yeniden şifreleme maliyeti).
+  static const int maxAddBytes = 512 * 1024 * 1024;
+
+  /// Bu boyuttan büyük dosyalar MKC1 parçalı biçime yazılır.
+  static const int chunkedThresholdBytes = 4 * 1024 * 1024;
+
+  /// Testlerde MKC1 eşiğini düşürmek için; üretimde null.
+  @visibleForTesting
+  static int? debugChunkedThresholdBytes;
+
+  static int get _effectiveChunkedThreshold =>
+      debugChunkedThresholdBytes ?? chunkedThresholdBytes;
+
+  /// Testlerde eşiği düşürmek için; üretimde null.
+  @visibleForTesting
+  static int? debugMaxAddBytes;
+
+  static int get _effectiveMaxAddBytes => debugMaxAddBytes ?? maxAddBytes;
+
   /// Arka arkaya hatalı deneme sayısına göre kilitlenme (saniye):
   /// 1. hata → 0 sn, 2. hata → 5 sn, 3. hata → 15 sn, 4. hata → 60 sn,
   /// 5. hata → 5 dk, 6. ve sonrası → 30 dk (üst sınır).
@@ -99,6 +130,10 @@ class VaultService {
 
   static Uint8List? _key;
 
+  /// Oturum boyunca (işlem belleğinde) tutulan PIN — biyometri ile
+  /// yeniden açmak için. Uygulama süreci bitince silinir; diske yazılmaz.
+  static String? _sessionPin;
+
   // ---------------------------------------------------------------- init --
 
   /// Uygulama açılışında çağrılabilir hazırlık adımı.
@@ -108,9 +143,17 @@ class VaultService {
 
   static bool get unlocked => _key != null;
 
+  /// Bu oturumda biyometri ile yeniden açılabilir mi?
+  static bool get hasSessionPin =>
+      _sessionPin != null && _sessionPin!.isNotEmpty;
+
   /// Anahtarı bellekten atar (kasa kilitlenir).
-  static void lock() {
+  ///
+  /// [clearSessionPin] true ise biyometri de bu oturumda kullanılamaz
+  /// (varsayılan: false — kilit sonrası parmak izi ile tekrar açılabilir).
+  static void lock({bool clearSessionPin = false}) {
     _key = null;
+    if (clearSessionPin) _sessionPin = null;
   }
 
   static Uint8List _requireKey() {
@@ -194,12 +237,13 @@ class VaultService {
       throw ArgumentError('PIN $pinMinLength-$pinMaxLength hane olmalı');
     }
     final salt = _randomBytes(_saltLen);
-    final key = _deriveKey(pin, salt, kdfIterations);
+    final key = await _deriveKeyAsync(pin, salt, kdfIterations);
     final verifier = _encrypt(key, _plainBytes(_verifierPlain));
     await _writeMeta(salt, verifier, kdfIterations);
     await _ensureDir();
     await _clearLockout();
     _key = key;
+    _sessionPin = pin;
   }
 
   /// Doğru PIN verilirse anahtarı belleğe alır; yanlışsa false döner.
@@ -210,14 +254,22 @@ class VaultService {
     if (await lockoutRemaining() > Duration.zero) return false;
     final meta = await _readMeta();
     if (meta == null) return false;
-    final key = _deriveKey(pin, meta.salt, meta.kdfIterations);
+    final key = await _deriveKeyAsync(pin, meta.salt, meta.kdfIterations);
     if (!_checkVerifier(key, meta.verifier)) {
       await _registerFailure();
       return false;
     }
     await _clearLockout();
     _key = key;
+    _sessionPin = pin;
     return true;
+  }
+
+  /// Oturum PIN'i ile yeniden aç (biyometri sonrası). Diskte PIN yok.
+  static Future<bool> unlockWithSessionPin() async {
+    final pin = _sessionPin;
+    if (pin == null || pin.isEmpty) return false;
+    return unlock(pin);
   }
 
   /// Tüm kasayı yeniden şifreler ve PIN'i değiştirir.
@@ -232,22 +284,41 @@ class VaultService {
     }
     final meta = await _readMeta();
     if (meta == null) throw StateError('Kasa oluşturulmamış');
-    final oldKey = _deriveKey(oldPin, meta.salt, meta.kdfIterations);
+    final oldKey = await _deriveKeyAsync(oldPin, meta.salt, meta.kdfIterations);
     if (!_checkVerifier(oldKey, meta.verifier)) {
       throw ArgumentError('Eski PIN hatalı');
     }
 
     final dir = await _ensureDir();
 
-    // Önce hepsi çözülür; yazmaya başlamadan hata çıkarsa veri kaybolmaz.
+    // Küçük dosyalar bellekte; MKC1 parçalı dosyalar diskten akışla
+    // yeniden şifrelenir (OOM önlenir).
     final pending = <_PendingEntry>[];
+    final chunkedIds = <String>[];
     await for (final entity in dir.list(followLinks: false)) {
       if (entity is! File) continue;
       final fileName = _baseName(entity.path);
       if (!fileName.endsWith('.enc')) continue;
-      final payload = _split(oldKey, await entity.readAsBytes());
+      final id = fileName.substring(0, fileName.length - 4);
+      if (await _isChunkedFile(entity)) {
+        final length = await entity.length();
+        if (length > _effectiveMaxAddBytes + 65536) {
+          throw StateError(
+            'Kasada çok büyük dosya var; PIN değiştirilemedi: $fileName',
+          );
+        }
+        chunkedIds.add(id);
+        continue;
+      }
+      final bytes = await entity.readAsBytes();
+      if (bytes.length > _effectiveMaxAddBytes + 4096) {
+        throw StateError(
+          'Kasada çok büyük dosya var; PIN değiştirilemedi: $fileName',
+        );
+      }
+      final payload = _split(oldKey, bytes);
       pending.add(_PendingEntry(
-        id: fileName.substring(0, fileName.length - 4),
+        id: id,
         name: payload.name,
         size: payload.size,
         added: payload.added,
@@ -256,23 +327,85 @@ class VaultService {
     }
 
     final newSalt = _randomBytes(_saltLen);
-    final newKey = _deriveKey(newPin, newSalt, kdfIterations);
-    for (final item in pending) {
-      await _entryFile(dir, item.id).writeAsBytes(
-        _join(
-          newKey,
-          name: item.name,
-          size: item.size,
-          added: item.added,
-          content: item.content,
-        ),
-        flush: true,
-      );
+    final newKey = await _deriveKeyAsync(newPin, newSalt, kdfIterations);
+
+    // Atomik: once staging'e yaz, sonra dosyalari degistir, meta EN SONDA.
+    final staging = Directory(
+      '${dir.path}${Platform.pathSeparator}.pin_change_${DateTime.now().millisecondsSinceEpoch}',
+    );
+    await staging.create(recursive: true);
+    final backups = <File>[];
+    final stagedIds = <String>[
+      ...pending.map((e) => e.id),
+      ...chunkedIds,
+    ];
+    try {
+      for (final item in pending) {
+        final staged = File(
+          '${staging.path}${Platform.pathSeparator}${item.id}.enc',
+        );
+        await staged.writeAsBytes(
+          _join(
+            newKey,
+            name: item.name,
+            size: item.size,
+            added: item.added,
+            content: item.content,
+          ),
+          flush: true,
+        );
+      }
+      for (final id in chunkedIds) {
+        final staged = File(
+          '${staging.path}${Platform.pathSeparator}$id.enc',
+        );
+        await _reencryptChunked(
+          oldKey: oldKey,
+          newKey: newKey,
+          source: _entryFile(dir, id),
+          dest: staged,
+        );
+      }
+      for (final id in stagedIds) {
+        final dest = _entryFile(dir, id);
+        final staged = File(
+          '${staging.path}${Platform.pathSeparator}$id.enc',
+        );
+        if (await dest.exists()) {
+          final bak = File('${dest.path}.bak');
+          if (await bak.exists()) await bak.delete();
+          await dest.rename(bak.path);
+          backups.add(bak);
+        }
+        await staged.rename(dest.path);
+      }
+      final newVerifier = _encrypt(newKey, _plainBytes(_verifierPlain));
+      await _writeMeta(newSalt, newVerifier, kdfIterations);
+      await _clearLockout();
+      _key = newKey;
+      for (final bak in backups) {
+        if (await bak.exists()) await bak.delete();
+      }
+    } catch (e) {
+      // Geri al: .bak varsa geri koy.
+      for (final bak in backups) {
+        try {
+          if (await bak.exists()) {
+            final destPath = bak.path.substring(0, bak.path.length - 4);
+            final dest = File(destPath);
+            if (await dest.exists()) await dest.delete();
+            await bak.rename(destPath);
+          }
+        } catch (_) {}
+      }
+      rethrow;
+    } finally {
+      try {
+        if (await staging.exists()) {
+          await staging.delete(recursive: true);
+        }
+      } catch (_) {}
     }
-    final newVerifier = _encrypt(newKey, _plainBytes(_verifierPlain));
-    await _writeMeta(newSalt, newVerifier, kdfIterations);
-    await _clearLockout();
-    _key = newKey;
   }
 
   /// Kasayı ve PIN'i tamamen siler.
@@ -353,19 +486,42 @@ class VaultService {
   // -------------------------------------------------------------- dosya --
 
   /// Dosyayı kopyalayıp şifreler; **kaynak dosya silinmez**.
+  ///
+  /// Küçük dosyalar tek AES-GCM bloğu; [chunkedThresholdBytes] üstü MKC1
+  /// parçalı biçimle diske akar (tüm içerik belleğe alınmaz).
   static Future<VaultEntry> add(File source) async {
     final key = _requireKey();
-    final content = await source.readAsBytes();
+    final length = await source.length();
+    final limit = _effectiveMaxAddBytes;
+    if (length > limit) {
+      throw StateError(
+        'Dosya çok büyük (en fazla ${limit ~/ (1024 * 1024)} MB). '
+        'Kasaya eklemek için daha küçük bir dosya seçin.',
+      );
+    }
     final added = DateTime.now();
     final name = _baseName(source.path);
     final id = _newId();
     final dir = await _ensureDir();
-    await _entryFile(dir, id).writeAsBytes(
-      _join(key, name: name, size: content.length, added: added,
-          content: content),
-      flush: true,
-    );
-    return VaultEntry(id: id, name: name, size: content.length, added: added);
+    final dest = _entryFile(dir, id);
+    if (length > _effectiveChunkedThreshold) {
+      await _writeChunked(
+        dest,
+        key,
+        name: name,
+        size: length,
+        added: added,
+        source: source,
+      );
+    } else {
+      final content = await source.readAsBytes();
+      await dest.writeAsBytes(
+        _join(key,
+            name: name, size: content.length, added: added, content: content),
+        flush: true,
+      );
+    }
+    return VaultEntry(id: id, name: name, size: length, added: added);
   }
 
   /// Kasadaki tüm dosyaların kayıtları (yeniden eskiye).
@@ -378,12 +534,12 @@ class VaultService {
       final fileName = _baseName(entity.path);
       if (!fileName.endsWith('.enc')) continue;
       try {
-        final payload = _split(key, await entity.readAsBytes());
+        final meta = await _readEntryMeta(key, entity);
         result.add(VaultEntry(
           id: fileName.substring(0, fileName.length - 4),
-          name: payload.name,
-          size: payload.size,
-          added: payload.added,
+          name: meta.name,
+          size: meta.size,
+          added: meta.added,
         ));
       } catch (_) {
         // Bozuk ya da bu anahtarla açılamayan kayıt atlanır.
@@ -405,23 +561,44 @@ class VaultService {
   static Future<File> exportTo(String id, String destDir) async {
     final key = _requireKey();
     final dir = await _ensureDir();
-    final payload = _split(key, await _entryFile(dir, id).readAsBytes());
+    final enc = _entryFile(dir, id);
     final dest = Directory(destDir);
     if (!await dest.exists()) await dest.create(recursive: true);
+    final meta = await _readEntryMeta(key, enc);
     final target = File(
-        '${dest.path}${Platform.pathSeparator}${_safeName(payload.name)}');
-    await target.writeAsBytes(payload.content, flush: true);
-    // Dışa aktarma yeni bir dosya yaratır → kategori boyutları tazelenir.
+        '${dest.path}${Platform.pathSeparator}${_safeName(meta.name)}');
+    if (await _isChunkedFile(enc)) {
+      await _exportChunked(key, enc, target);
+    } else {
+      final payload = _split(key, await enc.readAsBytes());
+      await target.writeAsBytes(payload.content, flush: true);
+    }
     await CategorySizeService.invalidate();
     return target;
   }
 
   // ---------------------------------------------------------- şifreleme --
 
-  static Uint8List _deriveKey(String pin, Uint8List salt, int iterations) {
-    final derivator = PBKDF2KeyDerivator(HMac(SHA256Digest(), 64));
-    derivator.init(Pbkdf2Parameters(salt, iterations, _keyLen));
-    return derivator.process(Uint8List.fromList(utf8.encode(pin)));
+  /// PBKDF2'yi arka izolatta çalıştırır — UI donmasını önler.
+  static Future<Uint8List> _deriveKeyAsync(
+    String pin,
+    Uint8List salt,
+    int iterations,
+  ) {
+    // İzolata yalnızca ilkel/kopyalanabilir veri gönderilir (sınıf yakalanmaz).
+    final request = (
+      pin: pin,
+      salt: Uint8List.fromList(salt),
+      iterations: iterations,
+      keyLen: _keyLen,
+    );
+    return Isolate.run(() {
+      final derivator = PBKDF2KeyDerivator(HMac(SHA256Digest(), 64));
+      derivator.init(
+        Pbkdf2Parameters(request.salt, request.iterations, request.keyLen),
+      );
+      return derivator.process(Uint8List.fromList(utf8.encode(request.pin)));
+    });
   }
 
   static bool _checkVerifier(Uint8List key, Uint8List verifier) {
@@ -491,6 +668,195 @@ class VaultService {
       added: DateTime.parse(header['a'] as String),
       content: body.sublist(4 + headerLen),
     );
+  }
+
+  static Future<bool> _isChunkedFile(File file) async {
+    final raf = await file.open();
+    try {
+      if (await raf.length() < 4) return false;
+      final magic = await raf.read(4);
+      return magic.length == 4 &&
+          magic[0] == _mkc1Magic[0] &&
+          magic[1] == _mkc1Magic[1] &&
+          magic[2] == _mkc1Magic[2] &&
+          magic[3] == _mkc1Magic[3];
+    } finally {
+      await raf.close();
+    }
+  }
+
+  static Future<({String name, int size, DateTime added})> _readEntryMeta(
+    Uint8List key,
+    File file,
+  ) async {
+    if (await _isChunkedFile(file)) {
+      final header = await _readChunkedHeader(key, file);
+      return (name: header.name, size: header.size, added: header.added);
+    }
+    final payload = _split(key, await file.readAsBytes());
+    return (name: payload.name, size: payload.size, added: payload.added);
+  }
+
+  static Future<({String name, int size, DateTime added, int chunkSize})>
+      _readChunkedHeader(Uint8List key, File file) async {
+    final raf = await file.open();
+    try {
+      await raf.setPosition(4); // magic sonrası
+      final lenBytes = await raf.read(4);
+      if (lenBytes.length < 4) {
+        throw const FormatException('Bozuk MKC1 başlığı');
+      }
+      final headerLen = ByteData.sublistView(lenBytes).getUint32(0);
+      final enc = await raf.read(headerLen);
+      if (enc.length != headerLen) {
+        throw const FormatException('Bozuk MKC1 başlığı');
+      }
+      final map = jsonDecode(utf8.decode(_decrypt(key, enc)))
+          as Map<String, dynamic>;
+      return (
+        name: map['n'] as String,
+        size: (map['s'] as num).toInt(),
+        added: DateTime.parse(map['a'] as String),
+        chunkSize: (map['cs'] as num?)?.toInt() ?? _plainChunkBytes,
+      );
+    } finally {
+      await raf.close();
+    }
+  }
+
+  static Future<void> _writeChunked(
+    File dest,
+    Uint8List key, {
+    required String name,
+    required int size,
+    required DateTime added,
+    required File source,
+  }) async {
+    final raf = await dest.open(mode: FileMode.write);
+    final src = await source.open();
+    try {
+      await raf.writeFrom(Uint8List.fromList(_mkc1Magic));
+      final headerPlain = _plainBytes(jsonEncode({
+        'n': name,
+        's': size,
+        'a': added.toIso8601String(),
+        'cs': _plainChunkBytes,
+      }));
+      final headerEnc = _encrypt(key, headerPlain);
+      final lenBuf = ByteData(4)..setUint32(0, headerEnc.length);
+      await raf.writeFrom(lenBuf.buffer.asUint8List());
+      await raf.writeFrom(headerEnc);
+
+      var remaining = size;
+      while (remaining > 0) {
+        final n = min(_plainChunkBytes, remaining);
+        final chunk = await src.read(n);
+        if (chunk.length != n) {
+          throw const FileSystemException('Dosya okuma yarım kaldı');
+        }
+        final enc = _encrypt(key, chunk);
+        final cLen = ByteData(4)..setUint32(0, enc.length);
+        await raf.writeFrom(cLen.buffer.asUint8List());
+        await raf.writeFrom(enc);
+        remaining -= n;
+      }
+    } finally {
+      await src.close();
+      await raf.close();
+    }
+  }
+
+  static Future<void> _exportChunked(
+    Uint8List key,
+    File encFile,
+    File target,
+  ) async {
+    final header = await _readChunkedHeader(key, encFile);
+    final raf = await encFile.open();
+    final out = await target.open(mode: FileMode.write);
+    try {
+      await raf.setPosition(4);
+      final lenBytes = await raf.read(4);
+      final headerLen = ByteData.sublistView(lenBytes).getUint32(0);
+      await raf.setPosition(4 + 4 + headerLen);
+
+      var remaining = header.size;
+      while (remaining > 0) {
+        final cLenBytes = await raf.read(4);
+        if (cLenBytes.length < 4) {
+          throw const FormatException('Bozuk MKC1 parçası');
+        }
+        final cLen = ByteData.sublistView(cLenBytes).getUint32(0);
+        final enc = await raf.read(cLen);
+        if (enc.length != cLen) {
+          throw const FormatException('Bozuk MKC1 parçası');
+        }
+        final plain = _decrypt(key, enc);
+        await out.writeFrom(plain);
+        remaining -= plain.length;
+      }
+      if (remaining != 0) {
+        throw const FormatException('MKC1 boyut uyuşmazlığı');
+      }
+    } finally {
+      await raf.close();
+      await out.close();
+    }
+  }
+
+  /// PIN değişiminde MKC1 dosyasını parçaları belleğe toplamadan yeniden şifreler.
+  static Future<void> _reencryptChunked({
+    required Uint8List oldKey,
+    required Uint8List newKey,
+    required File source,
+    required File dest,
+  }) async {
+    final header = await _readChunkedHeader(oldKey, source);
+    final src = await source.open();
+    final out = await dest.open(mode: FileMode.write);
+    try {
+      await src.setPosition(4);
+      final oldHdrLenBytes = await src.read(4);
+      final oldHdrLen = ByteData.sublistView(oldHdrLenBytes).getUint32(0);
+      await src.setPosition(4 + 4 + oldHdrLen);
+
+      await out.writeFrom(Uint8List.fromList(_mkc1Magic));
+      final headerPlain = _plainBytes(jsonEncode({
+        'n': header.name,
+        's': header.size,
+        'a': header.added.toIso8601String(),
+        'cs': header.chunkSize,
+      }));
+      final headerEnc = _encrypt(newKey, headerPlain);
+      final lenBuf = ByteData(4)..setUint32(0, headerEnc.length);
+      await out.writeFrom(lenBuf.buffer.asUint8List());
+      await out.writeFrom(headerEnc);
+
+      var remaining = header.size;
+      while (remaining > 0) {
+        final cLenBytes = await src.read(4);
+        if (cLenBytes.length < 4) {
+          throw const FormatException('Bozuk MKC1 parçası');
+        }
+        final cLen = ByteData.sublistView(cLenBytes).getUint32(0);
+        final enc = await src.read(cLen);
+        if (enc.length != cLen) {
+          throw const FormatException('Bozuk MKC1 parçası');
+        }
+        final plain = _decrypt(oldKey, enc);
+        final reenc = _encrypt(newKey, plain);
+        final nLen = ByteData(4)..setUint32(0, reenc.length);
+        await out.writeFrom(nLen.buffer.asUint8List());
+        await out.writeFrom(reenc);
+        remaining -= plain.length;
+      }
+      if (remaining != 0) {
+        throw const FormatException('MKC1 boyut uyuşmazlığı');
+      }
+    } finally {
+      await src.close();
+      await out.close();
+    }
   }
 
   // ------------------------------------------------------------ yardımcı --

@@ -1,0 +1,10 @@
+{
+  "@@locale": "en",
+  "appTitle": "Makay File Manager",
+  "settingsTitle": "Settings",
+  "vaultTitle": "Vault",
+  "networkAccessTitle": "Network access",
+  "cloudAdvancedTitle": "Cloud connections",
+  "continueAction": "Continue",
+  "cancelAction": "Cancel"
+}

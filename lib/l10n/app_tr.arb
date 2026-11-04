@@ -1,0 +1,25 @@
+{
+  "@@locale": "tr",
+  "appTitle": "Makay Dosya Yöneticisi",
+  "@appTitle": {
+    "description": "Uygulama adı / MaterialApp title"
+  },
+  "settingsTitle": "Ayarlar",
+  "@settingsTitle": {
+    "description": "Ayarlar ekranı başlığı"
+  },
+  "vaultTitle": "Kasa",
+  "@vaultTitle": {
+    "description": "Gizli klasör ekranı başlığı"
+  },
+  "networkAccessTitle": "Ağdan erişim",
+  "@networkAccessTitle": {
+    "description": "FTP/SMB sunucu ekranı başlığı"
+  },
+  "cloudAdvancedTitle": "Bulut bağlantıları",
+  "@cloudAdvancedTitle": {
+    "description": "Gelişmiş bulut ekranı / diyalog başlığı"
+  },
+  "continueAction": "Devam",
+  "cancelAction": "Vazgeç"
+}

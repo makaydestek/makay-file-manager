@@ -4,9 +4,11 @@ import 'dart:io';
 import 'package:flutter/material.dart';
 import 'package:path_provider/path_provider.dart';
 
+import '../services/auth_service.dart';
 import '../services/vault_service.dart';
 import '../theme/app_theme.dart';
 import '../utils/formats.dart';
+import '../widgets/tv_focusable.dart';
 
 /// Kasa (gizli klasör) ekranı: PIN oluşturma, kilitleme/açma, listeleme,
 /// dışa aktarma ve silme.
@@ -190,6 +192,73 @@ class _VaultScreenState extends State<VaultScreen> {
     await _refresh();
   }
 
+  /// Biyometri: PIN diske yazılmaz; yalnızca bu oturumda daha önce
+  /// girilmiş PIN ile yeniden açılır. Süreç yeniden başlarsa önce PIN gerekir.
+  Future<void> _unlockBiometric() async {
+    if (_lockoutLeft > Duration.zero) return;
+    if (!VaultService.hasSessionPin) {
+      ScaffoldMessenger.of(context).showSnackBar(
+        const SnackBar(
+          content: Text(
+            'Biyometri için önce bir kez PIN ile açın '
+            '(oturum boyunca geçerli)',
+          ),
+        ),
+      );
+      return;
+    }
+    final enabled = await AuthService.vaultBiometricsEnabled;
+    if (!enabled) return;
+    final bio = await AuthService.authenticateBiometric(
+      reason: 'Kasayı açmak için doğrulayın',
+    );
+    if (!bio || !mounted) return;
+    setState(() => _loading = true);
+    final ok = await VaultService.unlockWithSessionPin();
+    if (!mounted) return;
+    setState(() => _loading = false);
+    if (ok) {
+      await _refresh();
+    } else {
+      ScaffoldMessenger.of(context).showSnackBar(
+        const SnackBar(content: Text('Biyometri ile açılamadı; PIN deneyin')),
+      );
+    }
+  }
+
+  /// TV/OK ve satır dokunuşu: dışa aktar / sil seçenekleri.
+  Future<void> _entryActions(VaultEntry entry) async {
+    final action = await showModalBottomSheet<String>(
+      context: context,
+      builder: (context) => SafeArea(
+        child: Column(
+          mainAxisSize: MainAxisSize.min,
+          children: [
+            ListTile(
+              leading: const Icon(Icons.description_rounded),
+              title: Text(entry.name, maxLines: 1, overflow: TextOverflow.ellipsis),
+              subtitle: Text(Formats.size(entry.size)),
+            ),
+            const Divider(height: 1),
+            ListTile(
+              leading: const Icon(Icons.file_download_rounded),
+              title: const Text('Dışa aktar'),
+              onTap: () => Navigator.pop(context, 'export'),
+            ),
+            ListTile(
+              leading: const Icon(Icons.delete_outline_rounded),
+              title: const Text('Sil'),
+              onTap: () => Navigator.pop(context, 'delete'),
+            ),
+          ],
+        ),
+      ),
+    );
+    if (!mounted || action == null) return;
+    if (action == 'export') await _export(entry);
+    if (action == 'delete') await _delete(entry);
+  }
+
   Future<void> _export(VaultEntry entry) async {
     final String dest;
     try {
@@ -369,6 +438,23 @@ class _VaultScreenState extends State<VaultScreen> {
           const SizedBox(height: 24),
           Icon(Icons.lock_outline_rounded, size: 64, color: AppTheme.accent),
           const SizedBox(height: 24),
+          FutureBuilder<bool>(
+            future: AuthService.vaultBiometricsEnabled,
+            builder: (context, snap) {
+              if (snap.data != true) return const SizedBox.shrink();
+              return Padding(
+                padding: const EdgeInsets.only(bottom: 16),
+                child: TvFocusable(
+                  onActivate: lockedOut ? null : _unlockBiometric,
+                  child: OutlinedButton.icon(
+                    onPressed: lockedOut ? null : _unlockBiometric,
+                    icon: const Icon(Icons.fingerprint_rounded),
+                    label: const Text('Biyometri ile aç'),
+                  ),
+                ),
+              );
+            },
+          ),
           TextField(
             controller: _pin,
             obscureText: true,
@@ -400,10 +486,14 @@ class _VaultScreenState extends State<VaultScreen> {
             ),
           ],
           const SizedBox(height: 20),
-          FilledButton(
-            // Kilitlenme süresince açma denemesi yapılamaz.
-            onPressed: lockedOut || _loading ? null : _unlock,
-            child: const Text('KİLİT AÇ'),
+          TvFocusable(
+            autofocus: true,
+            onActivate: lockedOut || _loading ? null : _unlock,
+            child: FilledButton(
+              // Kilitlenme süresince açma denemesi yapılamaz.
+              onPressed: lockedOut || _loading ? null : _unlock,
+              child: const Text('KİLİT AÇ'),
+            ),
           ),
         ],
       ),
@@ -451,27 +541,33 @@ class _VaultScreenState extends State<VaultScreen> {
               itemCount: _entries.length,
               itemBuilder: (context, index) {
                 final entry = _entries[index];
-                return ListTile(
-                  leading:
-                      Icon(Icons.description_rounded, color: AppTheme.accent),
-                  title: Text(entry.name,
-                      maxLines: 1, overflow: TextOverflow.ellipsis),
-                  subtitle: Text(
-                      '${Formats.size(entry.size)} • ${Formats.date(entry.added)}'),
-                  trailing: Row(
-                    mainAxisSize: MainAxisSize.min,
-                    children: [
-                      IconButton(
-                        icon: const Icon(Icons.file_download_rounded),
-                        tooltip: 'Dışa aktar',
-                        onPressed: () => _export(entry),
-                      ),
-                      IconButton(
-                        icon: const Icon(Icons.delete_outline_rounded),
-                        tooltip: 'Sil',
-                        onPressed: () => _delete(entry),
-                      ),
-                    ],
+                return TvFocusable(
+                  autofocus: index == 0,
+                  onActivate: () => _entryActions(entry),
+                  scale: 1.02,
+                  child: ListTile(
+                    leading: Icon(Icons.description_rounded,
+                        color: AppTheme.accent),
+                    title: Text(entry.name,
+                        maxLines: 1, overflow: TextOverflow.ellipsis),
+                    subtitle: Text(
+                        '${Formats.size(entry.size)} • ${Formats.date(entry.added)}'),
+                    trailing: Row(
+                      mainAxisSize: MainAxisSize.min,
+                      children: [
+                        IconButton(
+                          icon: const Icon(Icons.file_download_rounded),
+                          tooltip: 'Dışa aktar',
+                          onPressed: () => _export(entry),
+                        ),
+                        IconButton(
+                          icon: const Icon(Icons.delete_outline_rounded),
+                          tooltip: 'Sil',
+                          onPressed: () => _delete(entry),
+                        ),
+                      ],
+                    ),
+                    onTap: () => _entryActions(entry),
                   ),
                 );
               },

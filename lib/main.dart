@@ -1,10 +1,13 @@
 import 'dart:async';
+import 'dart:ui';
 
 import 'package:dynamic_color/dynamic_color.dart';
+import 'package:flutter/foundation.dart';
 import 'package:flutter/material.dart';
 import 'package:flutter_localizations/flutter_localizations.dart';
 import 'package:provider/provider.dart';
 
+import 'l10n/app_localizations.dart';
 import 'models/home_category.dart';
 import 'providers/settings_provider.dart';
 import 'screens/browser_screen.dart';
@@ -22,16 +25,23 @@ import 'screens/global_search_screen.dart';
 import 'screens/network_access_screen.dart';
 import 'screens/remote_screen.dart';
 import 'screens/storage_analysis_screen.dart';
+import 'screens/app_lock_screen.dart';
+import 'screens/clean_center_screen.dart';
+import 'screens/privacy_screen.dart';
+import 'screens/receive_share_screen.dart';
 import 'screens/temp_cleaner_screen.dart';
 import 'screens/tv_home_screen.dart';
 import 'screens/usb_storage_screen.dart';
 import 'screens/vault_screen.dart';
+import 'services/auth_service.dart';
 import 'services/category_size_service.dart';
 import 'services/media_service.dart';
 import 'services/platform_service.dart';
 import 'services/update_service.dart';
 import 'theme/app_theme.dart';
 import 'utils/app_paths.dart';
+import 'utils/debug_log.dart';
+import 'utils/tv_ui.dart';
 import 'widgets/update_dialog.dart';
 
 /// Kök navigator (açılışta güncelleme diyaloğu için).
@@ -39,12 +49,35 @@ final GlobalKey<NavigatorState> rootNavigatorKey = GlobalKey<NavigatorState>();
 
 Future<void> main() async {
   WidgetsFlutterBinding.ensureInitialized();
+
+  // Beklenmeyen hataları yutmadan kaydet; kırmızı ekranı azalt.
+  FlutterError.onError = (details) {
+    FlutterError.presentError(details);
+    logSwallowed('FlutterError', details.exception);
+  };
+  PlatformDispatcher.instance.onError = (error, stack) {
+    logSwallowed('PlatformDispatcher', error);
+    return true; // işlendi — uygulama düşmesin
+  };
+
   final settings = await SettingsProvider.load();
-  runApp(
-    ChangeNotifierProvider.value(
-      value: settings,
-      child: const MakayApp(),
-    ),
+  // TV algılamasını açılışta çöz: auto modda TvUi / tema senkron kalsın.
+  await PlatformService.isTv();
+  runZonedGuarded(
+    () {
+      runApp(
+        ChangeNotifierProvider.value(
+          value: settings,
+          child: const MakayApp(),
+        ),
+      );
+    },
+    (error, stack) {
+      logSwallowed('Zone', error);
+      if (kDebugMode) {
+        debugPrint('$error\n$stack');
+      }
+    },
   );
 }
 
@@ -68,6 +101,16 @@ class _MakayAppState extends State<MakayApp> with WidgetsBindingObserver {
   /// Sürüm seçimi + izin onayı yeni tamamlandı mı?
   bool _setupDone = false;
 
+  /// Uygulama kilidi kapısı (A4).
+  bool _lockChecked = false;
+  bool _showLock = false;
+
+  /// Sistem paylaşımı kaydetme ekranı açık mı (yinelenmeyi önler).
+  bool _shareScreenOpen = false;
+
+  /// Kilit/kurulum bitene kadar bekletilen paylaşım dosyaları.
+  List<SharedInboxFile>? _deferredShare;
+
   /// İlk açılış akışı tamam mı? (sürüm seçimi ve izinler)
   static bool _isSetupComplete(SettingsProvider s) =>
       s.deviceModeChosen && s.permissionsOnboarded;
@@ -75,18 +118,109 @@ class _MakayAppState extends State<MakayApp> with WidgetsBindingObserver {
   @override
   void initState() {
     super.initState();
+    WidgetsBinding.instance.addObserver(this);
     WidgetsBinding.instance.addObserver(_resumeRefresh);
+    // Sistem "Paylaş" → uygulama (SEND / SEND_MULTIPLE).
+    PlatformService.ensureSharedFilesHandler();
+    PlatformService.onSharedFiles = _onSharedFiles;
     // Her açılışta GitHub depoda yeni sürüm sorgulanır (A15/A17).
-    WidgetsBinding.instance.addPostFrameCallback((_) {
+    WidgetsBinding.instance.addPostFrameCallback((_) async {
       _setupDone = _isSetupComplete(context.read<SettingsProvider>());
       _checkUpdate();
+      await _checkLockGate();
+      await _openPendingShare();
     });
   }
 
   @override
   void dispose() {
+    if (PlatformService.onSharedFiles == _onSharedFiles) {
+      PlatformService.onSharedFiles = null;
+    }
+    WidgetsBinding.instance.removeObserver(this);
     WidgetsBinding.instance.removeObserver(_resumeRefresh);
     super.dispose();
+  }
+
+  Future<void> _onSharedFiles(List<SharedInboxFile> files) async {
+    await _openShareScreen(files);
+  }
+
+  Future<void> _openPendingShare() async {
+    final files = await PlatformService.takeSharedFiles();
+    final merged = <SharedInboxFile>[];
+    void addAll(Iterable<SharedInboxFile>? list) {
+      if (list == null) return;
+      for (final f in list) {
+        if (merged.any((e) => e.path == f.path)) continue;
+        merged.add(f);
+      }
+    }
+
+    addAll(_deferredShare);
+    addAll(files);
+    _deferredShare = null;
+    if (merged.isEmpty) return;
+    await _openShareScreen(merged);
+  }
+
+  Future<void> _openShareScreen(List<SharedInboxFile> hint) async {
+    if (hint.isEmpty || _shareScreenOpen) return;
+    // Kilit kontrolü bitmeden veya kilit açıkken ertele.
+    if (!_lockChecked || _showLock) {
+      _deferredShare = hint;
+      return;
+    }
+    // Canlı bildirimde native kuyruğu da tüket.
+    final pending = await PlatformService.takeSharedFiles();
+    final files = <SharedInboxFile>[
+      ...hint,
+      if (pending != null)
+        for (final f in pending)
+          if (!hint.any((h) => h.path == f.path)) f,
+    ];
+    if (files.isEmpty) return;
+    final nav = rootNavigatorKey.currentState;
+    if (nav == null) {
+      _deferredShare = files;
+      return;
+    }
+    _shareScreenOpen = true;
+    _deferredShare = null;
+    try {
+      await nav.push(
+        MaterialPageRoute<void>(
+          builder: (_) => ReceiveShareScreen(files: files),
+        ),
+      );
+    } finally {
+      _shareScreenOpen = false;
+    }
+  }
+
+  @override
+  void didChangeAppLifecycleState(AppLifecycleState state) {
+    if (state == AppLifecycleState.paused ||
+        state == AppLifecycleState.inactive) {
+      AuthService.onPaused();
+    } else if (state == AppLifecycleState.resumed) {
+      unawaited(_onResumeLock());
+    }
+  }
+
+  Future<void> _checkLockGate() async {
+    final need = await AuthService.needsLockGate();
+    if (!mounted) return;
+    setState(() {
+      _lockChecked = true;
+      _showLock = need;
+    });
+  }
+
+  Future<void> _onResumeLock() async {
+    final need = await AuthService.shouldLockOnResume();
+    if (!mounted) return;
+    if (need) setState(() => _showLock = true);
   }
 
   Future<void> _checkUpdate() async {
@@ -133,22 +267,27 @@ class _MakayAppState extends State<MakayApp> with WidgetsBindingObserver {
   }
 
   Widget _app(SettingsProvider settings, ({Color? light, Color? dark})? seed) {
+    // TV sürümünde (veya auto + TV cihaz) tüm ekranlarda D-pad odak halkası.
+    final tvFocus = TvUi.enabledFor(settings);
     return MaterialApp(
-      title: 'Makay Dosya Yöneticisi',
+      onGenerateTitle: (context) => AppLocalizations.of(context).appTitle,
       debugShowCheckedModeBanner: false,
       navigatorKey: rootNavigatorKey,
       theme: AppTheme.light(
         dynamicSeed: seed?.light,
         appearance: settings.appearance,
+        tvFocus: tvFocus,
       ),
       darkTheme: AppTheme.dark(
         dynamicSeed: seed?.dark,
         appearance: settings.appearance,
+        tvFocus: tvFocus,
       ),
       themeMode: settings.themeMode,
       locale: const Locale('tr'),
-      supportedLocales: const [Locale('tr'), Locale('en')],
-      localizationsDelegates: const [
+      supportedLocales: AppLocalizations.supportedLocales,
+      localizationsDelegates: [
+        AppLocalizations.delegate,
         GlobalMaterialLocalizations.delegate,
         GlobalWidgetsLocalizations.delegate,
         GlobalCupertinoLocalizations.delegate,
@@ -160,16 +299,38 @@ class _MakayAppState extends State<MakayApp> with WidgetsBindingObserver {
       // ThemeData'da taşınmadığı için büyüme, sistem ölçeği **korunarak**
       // (erişilebilirlik ayarı ezilmez) yalnızca katsayıyla çarpılan
       // `textScaler` üzerinden uygulanır.
+      // Uygulama kilidi açıkken tüm rotaların üstüne kilit ekranı gelir.
       builder: (context, child) {
+        Widget content = child ?? const SizedBox.shrink();
         final factor = settings.appearance.fontSizeFactor;
-        if (factor == 1.0) return child!;
-        final media = MediaQuery.of(context);
-        return MediaQuery(
-          data: media.copyWith(
-            textScaler: TextScaler.linear(media.textScaler.scale(1.0) * factor),
-          ),
-          child: child!,
-        );
+        if (factor != 1.0) {
+          final media = MediaQuery.of(context);
+          content = MediaQuery(
+            data: media.copyWith(
+              textScaler:
+                  TextScaler.linear(media.textScaler.scale(1.0) * factor),
+            ),
+            child: content,
+          );
+        }
+        if (!_lockChecked) {
+          return const Scaffold(
+            body: Center(child: CircularProgressIndicator()),
+          );
+        }
+        if (_showLock) {
+          return AppLockScreen(
+            onUnlocked: () {
+              if (!mounted) return;
+              setState(() => _showLock = false);
+              // Kilit sırasında ertelenen sistem paylaşımını aç.
+              WidgetsBinding.instance.addPostFrameCallback((_) {
+                unawaited(_openPendingShare());
+              });
+            },
+          );
+        }
+        return content;
       },
     );
   }
@@ -184,12 +345,14 @@ class _MakayAppState extends State<MakayApp> with WidgetsBindingObserver {
 class _PopRefreshObserver extends NavigatorObserver {
   @override
   void didPop(Route<dynamic> route, Route<dynamic>? previousRoute) {
-    unawaited(CategorySizeService.refresh());
+    // İndirilenler / Yeni Dosyalar gibi ekranlardan dönüşte kartlar
+    // önbellek "taze" diye bayat kalmasın — zorunlu yenile.
+    unawaited(CategorySizeService.refresh(force: true));
   }
 
   @override
   void didRemove(Route<dynamic> route, Route<dynamic>? previousRoute) {
-    unawaited(CategorySizeService.refresh());
+    unawaited(CategorySizeService.refresh(force: true));
   }
 }
 
@@ -302,6 +465,10 @@ Route<dynamic> _onGenerateRoute(RouteSettings settings) {
       screen = const AppsScreen(initialIndex: 2);
     case '/temp':
       screen = const TempCleanerScreen();
+    case '/clean':
+      screen = const CleanCenterScreen();
+    case '/privacy':
+      screen = const PrivacyScreen();
     case '/cloud':
       screen = const CloudScreen();
     case '/remote':

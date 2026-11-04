@@ -177,7 +177,7 @@ ayrıca doldurulur; bu liste kararlılık regresyonunu hızlı yakalar.
 | S3 | 50+ MB dosya kopyala, iptal et | İlerleme + iptal; çift dosya yok | |
 | S4 | Farklı birime taşı (mümkünse USB/SD) | Kaynak silinemezse **uyarı** SnackBar | |
 | S5 | Bellek Analizi + Geçici Dosyalar aç | UI donmaz; sonuç gelir veya zaman aşımı mesajı | |
-| S6 | Kasa: PIN oluştur, küçük dosya ekle, çıkış/giriş | Açılır; büyük dosya (>64 MB) reddedilir | |
+| S6 | Kasa: PIN oluştur, küçük dosya ekle, çıkış/giriş | Açılır; >4 MB parçalı (MKC1); >512 MB reddedilir | |
 | S7 | Arşiv çıkar → İptal | Kısmi klasör temizlenir | |
 | S8 | Güncelleme diyaloğı (veya sahte release) | SHA yoksa / uyuşmazsa **kurulum yok** | |
 | S9 | TV veya yatay tablet (varsa) | Odak / çift panel çökmez | |
@@ -186,6 +186,7 @@ ayrıca doldurulur; bu liste kararlılık regresyonunu hızlı yakalar.
 
 | Sürüm | Tarih | Cihazlar | Sonuç | Notlar |
 |---|---|---|---|---|
+| 1.0.43+ | 2026-11-04 | — | ⏳ Bekliyor | A28 güvenlik + MKC1 kasa + tarayıcı parçalama sonrası smoke S1–S9 (en az C3) doldurulacak |
 | 1.0.31 | 2026-10-20 | — | ⏳ Bekliyor | Kararlılık sertleştirme (SHA zorunlu, izolat, kasa, arşiv iptal); smoke S1–S9 doldurulacak |
 | 1.0.10 | 2026-10-11 | C3 (emülatör) | ⚠️ Kısmi | Yalnızca otomatik testler koşuldu; cihaz matrisi bu sürümden itibaren uygulanacak |
 

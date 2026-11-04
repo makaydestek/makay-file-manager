@@ -1,40 +1,35 @@
+import 'dart:async';
 import 'dart:io';
 
 import 'package:flutter/material.dart';
 import 'package:provider/provider.dart';
-import 'package:share_plus/share_plus.dart';
 
 import '../models/file_entry.dart';
 import '../providers/settings_provider.dart';
-import '../services/archive_service.dart';
+import '../services/bookmark_service.dart';
+import '../services/browser_tab_store.dart';
+import '../services/category_size_service.dart';
 import '../services/clipboard_manager.dart';
 import '../services/file_service.dart';
-import '../services/recycle_bin_service.dart';
-import '../services/root_service.dart';
-import '../services/transfer.dart';
-import '../services/vault_service.dart';
-import '../utils/debug_log.dart';
 import '../utils/file_opener.dart';
-import '../utils/formats.dart';
-import '../widgets/apk_install_dialog.dart';
+import '../utils/folder_watcher.dart';
 import '../widgets/app_drawer.dart';
-import '../widgets/file_thumbnail.dart';
 import '../widgets/folder_tree_panel.dart';
+import '../widgets/path_chips.dart';
 import '../widgets/root_header.dart';
-import '../widgets/transfer_progress_dialog.dart';
 import 'archive_screen.dart';
-import 'hex_viewer_screen.dart';
-import 'sqlite_viewer_screen.dart';
-import 'text_editor_screen.dart';
+import 'browser/browser_body.dart';
+import 'browser/browser_file_actions.dart';
+import 'browser/browser_row_menu.dart';
 
 /// Önizleme uzantıları ve dosya açma mantığı [FileOpener]'da ortaktır
 /// (tarayıcı + cihaz geneli arama); buraya tekrar tanımlanmaz.
 
 /// Dosya tarayıcı ekranı: liste, sıralama, arama, dosya işlemleri.
 ///
-/// Başlık çubuğu tek satırdır (geri oku + kategori adı + arama/sıralama/menü);
-/// yol şeridi gösterilmez — üst klasörler sistem geri okuyla, tablet'te ise
-/// soldaki klasör ağacıyla gezilir.
+/// Başlık çubuğu tek satırdır; altında tıklanabilir yol chip'leri (PathChips)
+/// derin klasörlerde yön duygusu verir. Üst klasörler ayrıca sistem geri oku
+/// ve tablette klasör ağacıyla gezilir.
 class BrowserScreen extends StatefulWidget {
   const BrowserScreen({
     super.key,
@@ -63,7 +58,8 @@ class BrowserScreen extends StatefulWidget {
   State<BrowserScreen> createState() => _BrowserScreenState();
 }
 
-class _BrowserScreenState extends State<BrowserScreen> {
+class _BrowserScreenState extends State<BrowserScreen>
+    with WidgetsBindingObserver, BrowserFileActions<BrowserScreen> {
   static const _service = FileService();
 
   /// Çekmeceyi (hamburger menü) açmak için.
@@ -96,47 +92,163 @@ class _BrowserScreenState extends State<BrowserScreen> {
   final Set<String> _selected = {};
   bool get _selecting => _selected.isNotEmpty;
 
+  /// İşlem sonrası geçici vurgu (yeni/kopyalanan dosya noktası).
+  final Set<String> _highlighted = {};
+
+  /// Depolama kökü (yol chip'leri için).
+  static const _storageRoot = '/storage/emulated/0';
+
+  /// Canlı klasör izleyici (ekle/sil → sessiz yenileme).
+  late final FolderWatcher _watcher = FolderWatcher(
+    onChanged: _onFolderChanged,
+  );
+
+  /// Çakışan yüklemelerde bayat sonucu yok saymak için.
+  int _loadGen = 0;
+
+  /// İzleyici tetiklemelerinde ana sayfa kartlarını da tazele.
+  bool _sizesDirty = false;
+  Timer? _sizeRefreshTimer;
+
+  // --- BrowserFileActions host ---
+
+  @override
+  String get browserPath => _path;
+
+  @override
+  FileService get browserService => _service;
+
+  @override
+  Set<String> get browserSelected => _selected;
+
+  @override
+  Set<String> get browserHighlighted => _highlighted;
+
+  @override
+  List<FileEntry> get browserEntries => _entries;
+
+  @override
+  Future<void> browserReload({
+    bool quiet = false,
+    bool preserveSelection = false,
+  }) =>
+      _load(quiet: quiet, preserveSelection: preserveSelection);
+
   @override
   void initState() {
     super.initState();
+    WidgetsBinding.instance.addObserver(this);
     _path = widget.rootPath ?? '';
+    BookmarkStore.load();
     _load();
+    _startWatching();
+  }
+
+  String get _chipRoot {
+    if (_path.startsWith(_storageRoot)) return _storageRoot;
+    return widget.rootPath ?? _path;
   }
 
   @override
   void dispose() {
+    WidgetsBinding.instance.removeObserver(this);
+    _watcher.dispose();
+    _sizeRefreshTimer?.cancel();
     _searchController.dispose();
+    if (_sizesDirty) {
+      unawaited(CategorySizeService.invalidate());
+    }
     super.dispose();
   }
 
-  Future<void> _load() async {
+  @override
+  void didChangeAppLifecycleState(AppLifecycleState state) {
+    // Başka uygulamadan indirme/silme sonrası öne gelince liste hemen tazelenir.
+    if (state == AppLifecycleState.resumed && mounted) {
+      unawaited(_load(quiet: true));
+    }
+  }
+
+  void _startWatching() {
+    if (_path.isEmpty) {
+      _watcher.stop();
+      return;
+    }
+    // İndirilenler alt klasörleri de yakalansın; yoklama watch kaçaklarını örter.
+    _watcher.start([_path], recursive: true);
+  }
+
+  void _onFolderChanged() {
+    if (!mounted) return;
+    // Liste hemen (debounce zaten FolderWatcher'da); kart boyutları
+    // indirme sırasında her olayda ağır tarama yapmasın diye kısılır.
+    unawaited(_load(quiet: true, preserveSelection: true));
+    _scheduleSizeRefresh();
+  }
+
+  void _scheduleSizeRefresh() {
+    _sizesDirty = true;
+    _sizeRefreshTimer ??= Timer(const Duration(seconds: 2), () {
+      _sizeRefreshTimer = null;
+      _sizesDirty = false;
+      unawaited(CategorySizeService.invalidate());
+    });
+  }
+
+  /// [quiet]: spinner göstermeden arka planda yeniler (canlı izleme).
+  /// [preserveSelection]: izleyici yenilemesinde seçimi korur.
+  Future<void> _load({
+    bool quiet = false,
+    bool preserveSelection = false,
+  }) async {
     if (_path.isEmpty) {
       setState(() => _loading = false);
       return;
     }
-    setState(() {
-      _loading = true;
-      // İçerik yenilendi; eski adetler bayat olabilir.
-      _childCounts = {};
-    });
-    final showHidden = false;
+    final gen = ++_loadGen;
+    final showSpinner = !quiet || _entries.isEmpty;
+    if (showSpinner) {
+      setState(() {
+        _loading = true;
+        // İçerik yenilendi; eski adetler bayat olabilir.
+        _childCounts = {};
+      });
+    }
+    final showHidden =
+        context.read<SettingsProvider>().showHiddenFiles;
     var entries = await _service.listDirectory(_path, showHidden: showHidden);
     entries = _sort(entries);
-    if (!mounted) return;
+    if (!mounted || gen != _loadGen) return;
+    final keep = preserveSelection
+        ? _selected.intersection({for (final e in entries) e.path})
+        : <String>{};
     setState(() {
       _entries = entries;
       _loading = false;
-      _selected.clear();
+      if (preserveSelection) {
+        _selected
+          ..clear()
+          ..addAll(keep);
+      } else {
+        _selected.clear();
+      }
+      if (!showSpinner) {
+        // Sessiz yenilemede de adetler bayat kalmasın.
+        _childCounts = {};
+      }
     });
     // Adetler liste görünürken arka planda toplanır (satır "N öğe" yazar).
-    _loadChildCounts(entries);
+    _loadChildCounts(entries, showHidden: showHidden);
   }
 
   /// Klasörlerin doğrudan çocuk sayılarını arka planda toplar.
   ///
   /// Erişilemeyen klasörlerde (izin vb.) sayı null kalır. Gizli (nokta)
   /// girdiler, listeyle aynı kural gereği sayılmaz.
-  Future<void> _loadChildCounts(List<FileEntry> entries) async {
+  Future<void> _loadChildCounts(
+    List<FileEntry> entries, {
+    required bool showHidden,
+  }) async {
     for (final e in entries) {
       if (!e.isDirectory) continue;
       int? count;
@@ -150,7 +262,7 @@ class _BrowserScreenState extends State<BrowserScreen> {
             i--;
           }
           final name = i >= 0 ? segments[i] : '';
-          if (name.startsWith('.')) continue;
+          if (!showHidden && name.startsWith('.')) continue;
           if (++n > _countCap) break;
         }
         count = n;
@@ -160,13 +272,6 @@ class _BrowserScreenState extends State<BrowserScreen> {
       if (!mounted) return;
       setState(() => _childCounts[e.path] = count);
     }
-  }
-
-  /// Klasör satır altı metni: adet biliniyorsa "N öğe", değilse "Klasör".
-  String _folderSubtitle(FileEntry e) {
-    final n = _childCounts[e.path];
-    if (n == null) return 'Klasör';
-    return n > _countCap ? '$_countCap+ öğe' : '$n öğe';
   }
 
   List<FileEntry> _sort(List<FileEntry> entries) {
@@ -217,10 +322,25 @@ class _BrowserScreenState extends State<BrowserScreen> {
     }
   }
 
+  /// Klasörü yeni sekmede açar (MiXplorer tarzı).
+  void _openInNewTab(FileEntry e) {
+    if (!e.isDirectory) return;
+    BrowserTabStore.open(title: e.name, path: e.path);
+    Navigator.of(context).push(
+      MaterialPageRoute(
+        builder: (_) => BrowserScreen(
+          title: e.name,
+          rootPath: e.path,
+          showHomeShortcut: widget.showHomeShortcut,
+        ),
+      ),
+    );
+  }
+
   /// Dosya türüne göre yerleşik önizleme [FileOpener] ile açılır;
   /// desteklenmeyen türde bilgi diyaloğu gösterilir.
   void _openPreview(FileEntry e) {
-    FileOpener.openFile(context, e, onUnsupported: () => _showInfo(e));
+    FileOpener.openFile(context, e, onUnsupported: () => showInfo(e));
   }
 
   /// Arşiv dosyasını arşiv görüntüleyici ekranında açar.
@@ -232,636 +352,39 @@ class _BrowserScreenState extends State<BrowserScreen> {
     );
   }
 
-  /// Seçili öğeleri (tek tek dosyalar ve klasör alt ağaçlarıyla) bu klasöre
-  /// ZIP arşivi olarak yazar ve listeyi tazeler.
-  Future<void> _compressToZip(List<FileEntry> entries) async {
-    if (entries.isEmpty) {
-      ScaffoldMessenger.of(context).showSnackBar(
-        const SnackBar(content: Text('Sıkıştırılacak öğe seçin')),
-      );
-      return;
-    }
-    final outPath = ArchiveService.suggestedZipPath(_path, entries.first.name);
-    try {
-      final count = await ArchiveService().createZip(
-        sourcePaths: [for (final e in entries) e.path],
-        outPath: outPath,
-      );
-      if (!mounted) return;
-      setState(_selected.clear);
-      await _load();
-      if (!mounted) return;
-      ScaffoldMessenger.of(context).showSnackBar(
-        SnackBar(
-          content: Text(
-              'Arşiv oluşturuldu: ${outPath.split(Platform.pathSeparator).last}'
-              ' ($count dosya)'),
+  /// Yol chip'inden veya kısayoldan klasöre git.
+  void _navigateToPath(String path) {
+    if (path == _path || path.isEmpty) return;
+    final sep = Platform.pathSeparator;
+    final i = path.lastIndexOf(sep);
+    final name = i >= 0 ? path.substring(i + 1) : path;
+    Navigator.of(context).pushReplacement(
+      MaterialPageRoute(
+        builder: (_) => BrowserScreen(
+          title: name.isEmpty ? path : name,
+          rootPath: path,
+          showHomeShortcut: widget.showHomeShortcut,
+          showRootDrawer: path == _storageRoot || path == widget.rootPath,
         ),
-      );
-    } catch (err) {
-      if (!mounted) return;
-      ScaffoldMessenger.of(context).showSnackBar(
-        SnackBar(content: Text('Arşiv oluşturulamadı: $err')),
-      );
-    }
-  }
-
-  /// Seçim modundaki tüm öğeleri ZIP'e ekler.
-  Future<void> _compressSelected() async {
-    final entries =
-        _entries.where((e) => _selected.contains(e.path)).toList();
-    await _compressToZip(entries);
+      ),
+    );
   }
 
   /// Satır menüsü: bilgi, metin/hex/SQLite açma, kasaya taşıma.
   void _rowMenu(FileEntry e) {
-    final ext = e.name.contains('.') ? e.name.split('.').last.toLowerCase() : '';
-    showModalBottomSheet<void>(
-      context: context,
-      builder: (context) => SafeArea(
-        child: Column(
-          mainAxisSize: MainAxisSize.min,
-          children: [
-            ListTile(
-              leading: const Icon(Icons.info_outline_rounded),
-              title: Text(e.name, maxLines: 1, overflow: TextOverflow.ellipsis),
-              subtitle: const Text('Bilgi'),
-              onTap: () {
-                Navigator.pop(context);
-                _showInfo(e);
-              },
-            ),
-            ListTile(
-              leading: const Icon(Icons.copy_rounded),
-              title: const Text('Kopyala'),
-              subtitle: const Text('Hedef klasörde "Yapıştır" ile bırakılır'),
-              onTap: () {
-                Navigator.pop(context);
-                _copySelectionToClipboard([e], cut: false);
-              },
-            ),
-            ListTile(
-              leading: const Icon(Icons.content_cut_rounded),
-              title: const Text('Taşı'),
-              subtitle: const Text('Hedef klasörde "Yapıştır" ile taşınır'),
-              onTap: () {
-                Navigator.pop(context);
-                _copySelectionToClipboard([e], cut: true);
-              },
-            ),
-            ListTile(
-              leading: const Icon(Icons.delete_outline_rounded),
-              title: const Text('Sil'),
-              subtitle: const Text(
-                  'Geri dönüşüm kutusuna taşır (ayar değiştirilebilir)'),
-              onTap: () {
-                Navigator.pop(context);
-                _deleteEntries([e]);
-              },
-            ),
-            if (!e.isDirectory && ext == 'apk')
-              ListTile(
-                leading: const Icon(Icons.android_rounded),
-                title: const Text('Kur / Güncelle'),
-                subtitle: const Text('Android kurucusunu açar'),
-                onTap: () {
-                  Navigator.pop(context);
-                  showApkInstallDialog(context, File(e.path));
-                },
-              ),
-            if (!e.isDirectory && ArchiveService.isArchive(e.name))
-              ListTile(
-                leading: const Icon(Icons.folder_zip_outlined),
-                title: const Text('Arşivi görüntüle'),
-                subtitle: const Text('İçeriği gezin, çıkar'),
-                onTap: () {
-                  Navigator.pop(context);
-                  _openArchive(e);
-                },
-              ),
-            ListTile(
-              leading: const Icon(Icons.archive_outlined),
-              title: const Text('Buraya sıkıştır'),
-              subtitle: const Text('ZIP arşivi oluşturur'),
-              onTap: () {
-                Navigator.pop(context);
-                _compressToZip([e]);
-              },
-            ),
-            if (!e.isDirectory && kTextExts.contains(ext))
-              ListTile(
-                leading: const Icon(Icons.text_snippet_outlined),
-                title: const Text('Metin olarak aç'),
-                onTap: () {
-                  Navigator.pop(context);
-                  Navigator.of(context).push(
-                    MaterialPageRoute(
-                      builder: (_) =>
-                          TextEditorScreen(file: File(e.path), title: e.name),
-                    ),
-                  );
-                },
-              ),
-            if (!e.isDirectory)
-              ListTile(
-                leading: const Icon(Icons.data_object_rounded),
-                title: const Text('Hex görüntüle'),
-                onTap: () {
-                  Navigator.pop(context);
-                  Navigator.of(context).push(
-                    MaterialPageRoute(
-                      builder: (_) =>
-                          HexViewerScreen(file: File(e.path), title: e.name),
-                    ),
-                  );
-                },
-              ),
-            if (!e.isDirectory && kSqliteExts.contains(ext))
-              ListTile(
-                leading: const Icon(Icons.table_chart_rounded),
-                title: const Text('SQLite tablolarını görüntüle'),
-                onTap: () {
-                  Navigator.pop(context);
-                  Navigator.of(context).push(
-                    MaterialPageRoute(
-                      builder: (_) => SqliteViewerScreen(
-                          file: File(e.path), title: e.name),
-                    ),
-                  );
-                },
-              ),
-            if (!e.isDirectory)
-              ListTile(
-                leading: const Icon(Icons.lock_outline_rounded),
-                title: const Text('Kasaya taşı'),
-                subtitle: const Text('PIN ile şifrelenir, kasa dışında saklanır'),
-                onTap: () {
-                  Navigator.pop(context);
-                  _addToVault(e);
-                },
-              ),
-            ListTile(
-              leading: const Icon(Icons.admin_panel_settings_outlined),
-              title: const Text('İzinleri değiştir (chmod)'),
-              subtitle: const Text('Root\'lu cihazlarda dosya izinleri'),
-              onTap: () {
-                Navigator.pop(context);
-                _chmodDialog(e);
-              },
-            ),
-          ],
-        ),
-      ),
+    showBrowserRowMenu(
+      hostContext: context,
+      entry: e,
+      onInfo: () => showInfo(e),
+      onOpenInNewTab: () => _openInNewTab(e),
+      onCopyOrCut: ({required bool cut}) =>
+          copySelectionToClipboard([e], cut: cut),
+      onDelete: () => deleteEntries([e]),
+      onOpenArchive: () => _openArchive(e),
+      onCompress: () => compressToZip([e]),
+      onAddToVault: () => addToVault(e),
+      onChmod: () => chmodDialog(e),
     );
-  }
-
-  /// Dosyayı kopyalayıp şifreli kasaya ekler (kaynak dosya yerinde kalır).
-  Future<void> _addToVault(FileEntry e) async {
-    if (!VaultService.unlocked) {
-      // Önce kasa ekranı açılır; kullanıcı PIN ile girip döner.
-      final opened = await Navigator.of(context).pushNamed('/vault');
-      if (opened != true || !mounted) return;
-    }
-    if (!mounted || !VaultService.unlocked) return;
-    try {
-      final entry = await VaultService.add(File(e.path));
-      if (!mounted) return;
-      ScaffoldMessenger.of(context).showSnackBar(
-        SnackBar(content: Text('${entry.name} kasaya eklendi (şifrelendi)')),
-      );
-    } catch (err) {
-      if (!mounted) return;
-      ScaffoldMessenger.of(context).showSnackBar(
-        SnackBar(content: Text('Kasaya eklenemedi: $err')),
-      );
-    }
-  }
-
-  /// Root'lu cihazlarda izin değiştirme diyaloğu; root yoksa bilgilendirir.
-  Future<void> _chmodDialog(FileEntry e) async {
-    final rooted = await RootService.isRooted();
-    if (!mounted) return;
-    if (!rooted) {
-      ScaffoldMessenger.of(context).showSnackBar(
-        const SnackBar(
-          content: Text(
-              'Kök (root) erişimi bulunamadı. chmod yalnızca root\'lu '
-              'cihazlarda çalışır.'),
-        ),
-      );
-      return;
-    }
-    var current = '';
-    try {
-      current = RootService.modeToString(File(e.path).statSync().mode);
-    } catch (e) {
-      logSwallowed('tarayıcı: chmod izin okuma', e);
-    }
-    final controller = TextEditingController(text: RootService.parseMode(current) ?? '644');
-    final mode = await showDialog<String>(
-      context: context,
-      builder: (context) => AlertDialog(
-        title: const Text('İzinleri değiştir (chmod)'),
-        content: Column(
-          mainAxisSize: MainAxisSize.min,
-          crossAxisAlignment: CrossAxisAlignment.start,
-          children: [
-            Text(e.name, maxLines: 1, overflow: TextOverflow.ellipsis),
-            const SizedBox(height: 8),
-            Text('Mevcut: $current'),
-            const SizedBox(height: 12),
-            TextField(
-              controller: controller,
-              autofocus: true,
-              keyboardType: TextInputType.number,
-              decoration: const InputDecoration(
-                labelText: 'Yeni izin (sekizlik)',
-                hintText: '644, 755, 0755 …',
-              ),
-            ),
-          ],
-        ),
-        actions: [
-          TextButton(
-            onPressed: () => Navigator.pop(context),
-            child: const Text('İptal'),
-          ),
-          FilledButton(
-            onPressed: () => Navigator.pop(context, controller.text.trim()),
-            child: const Text('Uygula'),
-          ),
-        ],
-      ),
-    );
-    if (mode == null || mode.isEmpty) return;
-    try {
-      final ok = await RootService.chmod(e.path, mode);
-      if (!mounted) return;
-      ScaffoldMessenger.of(context).showSnackBar(
-        SnackBar(
-          content: Text(ok
-              ? 'İzinler güncellendi: $mode'
-              : 'chmod başarısız oldu'),
-        ),
-      );
-      if (ok && mounted) _load();
-    } catch (err) {
-      if (!mounted) return;
-      ScaffoldMessenger.of(context).showSnackBar(
-        SnackBar(content: Text('Hata: $err')),
-      );
-    }
-  }
-
-  /// Çift panel sürükle-bırak: dosya hedef klasöre kopyalanır.
-  Future<void> _copyToFolder(String filePath, String targetFolder) async {
-    if (filePath == targetFolder) return;
-    // Kendi kendine kopyalama engeli.
-    final parent = File(filePath).parent.path;
-    if (parent == targetFolder) {
-      ScaffoldMessenger.of(context).showSnackBar(
-        const SnackBar(content: Text('Dosya zaten bu klasörde')),
-      );
-      return;
-    }
-    final name = filePath.split(Platform.pathSeparator).last;
-    try {
-      await showTransferProgress(
-        context,
-        title: 'Kopyalanıyor',
-        action: (onProgress, token) => _service.copyPath(
-          filePath,
-          targetFolder,
-          onProgress: onProgress,
-          cancelToken: token,
-        ),
-      );
-      if (!mounted) return;
-      ScaffoldMessenger.of(context).showSnackBar(
-        SnackBar(content: Text('$name kopyalandı → $targetFolder')),
-      );
-      // Hedef bu ekrandaysa liste tazelenir.
-      if (targetFolder == _path && mounted) _load();
-    } on TransferCancelled {
-      if (!mounted) return;
-      ScaffoldMessenger.of(context).showSnackBar(
-        SnackBar(content: Text('$name kopyalaması iptal edildi')),
-      );
-    } catch (err) {
-      if (!mounted) return;
-      ScaffoldMessenger.of(context).showSnackBar(
-        SnackBar(content: Text('Kopyalanamadı: $err')),
-      );
-    }
-  }
-
-  /// Seçili dosyaları sistem paylaşım sayfasıyla paylaş.
-  Future<void> _shareSelected() async {
-    final paths = _entries
-        .where((e) => _selected.contains(e.path) && !e.isDirectory)
-        .map((e) => e.path)
-        .toList();
-    if (paths.isEmpty) {
-      ScaffoldMessenger.of(context).showSnackBar(
-        const SnackBar(content: Text('Paylaşılacak dosya seçin')),
-      );
-      return;
-    }
-    setState(_selected.clear);
-    await SharePlus.instance.share(
-      ShareParams(files: [for (final p in paths) XFile(p)]),
-    );
-  }
-
-  /// Panodaki öğeleri bu klasöre yapıştırır.
-  ///
-  /// Tüm öğeler **tek bir** ilerleme diyaloğu altında yürür: önce
-  /// [FileService.estimate] ile genel toplam alınır, her öğenin ilerlemesi
-  /// tamamlananlara eklenerek global olarak monoton bir çubuk sunulur.
-  Future<void> _paste() async {
-    final clipboard = ClipboardManager.instance;
-    if (clipboard.isEmpty) return;
-    final target = _path;
-    final isCut = clipboard.isCut;
-    final entries = List<FileEntry>.of(clipboard.entries);
-
-    final total = await _service.estimate([for (final e in entries) e.path]);
-    if (!mounted) return;
-
-    var doneFiles = 0;
-
-    try {
-      await showTransferProgress(
-        context,
-        title: isCut ? 'Taşınıyor' : 'Kopyalanıyor',
-        action: (onProgress, token) => _pasteAll(
-          entries: entries,
-          target: target,
-          isCut: isCut,
-          total: total,
-          onProgress: onProgress,
-          token: token,
-          onStep: (files) => doneFiles = files,
-        ),
-      );
-    } on TransferCancelled {
-      if (!mounted) return;
-      ScaffoldMessenger.of(context).showSnackBar(
-        const SnackBar(content: Text('İşlem iptal edildi')),
-      );
-      _load();
-      return;
-    } catch (err) {
-      if (!mounted) return;
-      ScaffoldMessenger.of(context).showSnackBar(
-        SnackBar(content: Text('Yapıştırılamadı: $err')),
-      );
-      return;
-    }
-
-    if (isCut) clipboard.clear();
-    if (mounted) {
-      _load();
-      ScaffoldMessenger.of(context).showSnackBar(
-        SnackBar(content: Text(
-            'Yapıştırıldı: ${entries.length} öğe'
-            '${doneFiles > 0 ? ' ($doneFiles dosya)' : ''}')),
-      );
-    }
-  }
-
-  /// Panodaki her öğeyi sırayla taşır/kopyalar ve genel toplamı raporlar.
-  Future<TransferResult> _pasteAll({
-    required List<FileEntry> entries,
-    required String target,
-    required bool isCut,
-    required ({int files, int bytes}) total,
-    required void Function(TransferProgress) onProgress,
-    required CancelToken token,
-    required void Function(int files) onStep,
-  }) async {
-    var files = 0;
-    var bytes = 0;
-    for (final entry in entries) {
-      final result = isCut
-          ? await _service.moveEntry(
-              entry,
-              target,
-              cancelToken: token,
-              onProgress: (p) => onProgress(TransferProgress(
-                phase: p.phase,
-                doneFiles: files + p.doneFiles,
-                doneBytes: bytes + p.doneBytes,
-                totalFiles: total.files,
-                totalBytes: total.bytes,
-                currentPath: p.currentPath,
-              )),
-            )
-          : await _service.copyEntry(
-              entry,
-              target,
-              cancelToken: token,
-              onProgress: (p) => onProgress(TransferProgress(
-                phase: p.phase,
-                doneFiles: files + p.doneFiles,
-                doneBytes: bytes + p.doneBytes,
-                totalFiles: total.files,
-                totalBytes: total.bytes,
-                currentPath: p.currentPath,
-              )),
-            );
-      files += result.files;
-      bytes += result.bytes;
-      onStep(files);
-      // Öğe bitimi: çubuk öğeler arası boşlukta da ilerlesin.
-      onProgress(TransferProgress(
-        phase: TransferPhase.copying,
-        doneFiles: files,
-        doneBytes: bytes,
-        totalFiles: total.files,
-        totalBytes: total.bytes,
-      ));
-    }
-    return TransferResult(files: files, bytes: bytes, cancelled: false);
-  }
-
-  /// Seçili/verilen öğeleri siler: geri dönüşüm kutusu ya da kalıcı.
-  Future<void> _deleteSelected() async =>
-      _deleteEntries(_entries.where((e) => _selected.contains(e.path)));
-
-  Future<void> _deleteEntries(Iterable<FileEntry> targets) async {
-    final entries = targets.toList(growable: false);
-    if (entries.isEmpty) return;
-    final settings = context.read<SettingsProvider>();
-    final count = entries.length;
-    final useBin = settings.recycleBinDefault;
-    var confirmed = !settings.recycleBinConfirm;
-    if (!confirmed) {
-      confirmed = await showDialog<bool>(
-            context: context,
-            builder: (context) => AlertDialog(
-              title: Text(useBin ? 'Geri dönüşüm kutusuna taşı' : 'Kalıcı sil'),
-              content: Text('$count öğe silinecek.'),
-              actions: [
-                TextButton(
-                  onPressed: () => Navigator.pop(context, false),
-                  child: const Text('İptal'),
-                ),
-                FilledButton(
-                  onPressed: () => Navigator.pop(context, true),
-                  child: const Text('Sil'),
-                ),
-              ],
-            ),
-          ) ??
-          false;
-    }
-    if (!confirmed) return;
-    for (final entry in entries) {
-      try {
-        if (useBin) {
-          await RecycleBinService.instance.moveToRecycle(entry);
-        } else {
-          await _service.deleteEntry(entry.path, useRecycleBin: false);
-        }
-      } catch (e) {
-        logSwallowed('tarayıcı: silme', e);
-      }
-    }
-    if (mounted) {
-      setState(_selected.clear);
-      _load();
-    }
-  }
-
-  /// Seçimi panoya alır ve kullanıcıyı "Yapıştır"a yönlendirir.
-  void _copySelectionToClipboard(List<FileEntry> entries, {required bool cut}) {
-    if (entries.isEmpty) return;
-    if (cut) {
-      ClipboardManager.instance.cut(entries);
-    } else {
-      ClipboardManager.instance.copy(entries);
-    }
-    setState(_selected.clear);
-    ScaffoldMessenger.of(context).showSnackBar(
-      SnackBar(
-        content: Text(
-          '${entries.length} öğe ${cut ? 'taşınmak' : 'kopyalanmak'} üzere '
-          'alındı — hedef klasörde "Yapıştır"a dokunun',
-        ),
-      ),
-    );
-  }
-
-  Future<void> _rename(FileEntry e) async {
-    final controller = TextEditingController(text: e.name);
-    final newName = await showDialog<String>(
-      context: context,
-      builder: (context) => AlertDialog(
-        title: const Text('Yeniden adlandır'),
-        content: TextField(
-          controller: controller,
-          autofocus: true,
-          decoration: const InputDecoration(labelText: 'Yeni ad'),
-        ),
-        actions: [
-          TextButton(
-            onPressed: () => Navigator.pop(context),
-            child: const Text('İptal'),
-          ),
-          FilledButton(
-            onPressed: () => Navigator.pop(context, controller.text.trim()),
-            child: const Text('Tamam'),
-          ),
-        ],
-      ),
-    );
-    if (newName == null || newName.isEmpty || newName == e.name) return;
-    try {
-      await _service.rename(e.path, newName);
-    } catch (e) {
-      logSwallowed('tarayıcı: yeniden adlandırma', e);
-    }
-    if (mounted) _load();
-  }
-
-  Future<void> _newFolder() async {
-    final controller = TextEditingController();
-    final name = await showDialog<String>(
-      context: context,
-      builder: (context) => AlertDialog(
-        title: const Text('Yeni klasör'),
-        content: TextField(
-          controller: controller,
-          autofocus: true,
-          decoration: const InputDecoration(labelText: 'Klasör adı'),
-        ),
-        actions: [
-          TextButton(
-            onPressed: () => Navigator.pop(context),
-            child: const Text('İptal'),
-          ),
-          FilledButton(
-            onPressed: () => Navigator.pop(context, controller.text.trim()),
-            child: const Text('Oluştur'),
-          ),
-        ],
-      ),
-    );
-    if (name == null || name.isEmpty) return;
-    try {
-      await _service.createDirectory('$_path${Platform.pathSeparator}$name');
-    } catch (e) {
-      logSwallowed('tarayıcı: klasör oluşturma', e);
-    }
-    if (mounted) _load();
-  }
-
-  void _showInfo(FileEntry e) async {
-    final datePattern = context.read<SettingsProvider>().datePattern;
-    // Klasörün "boyut" alanı dosya girdisinin kendisine ait değildir; gerçek
-    // özyinelemeli boyut (içindeki dosyaların toplamı) ayrıca hesaplanır.
-    String? folderSize;
-    if (e.isDirectory) {
-      folderSize = Formats.size(await _service.directorySize(e.path));
-      if (!mounted) return;
-    }
-    showDialog<void>(
-      context: context,
-      builder: (context) => AlertDialog(
-        title: Text(e.name),
-        content: Column(
-          mainAxisSize: MainAxisSize.min,
-          crossAxisAlignment: CrossAxisAlignment.start,
-          children: [
-            Text('Tür: ${e.kind.name}'),
-            Text('Boyut: ${folderSize ?? Formats.size(e.size)}'),
-            Text(
-                'Değiştirilme: ${Formats.date(e.modified, pattern: datePattern)}'),
-            if (_permissionText(e.path) != null)
-              Text('İzinler: ${_permissionText(e.path)}'),
-            const SizedBox(height: 8),
-            SelectableText('Konum: ${e.path}'),
-          ],
-        ),
-        actions: [
-          FilledButton(
-            onPressed: () => Navigator.pop(context),
-            child: const Text('Tamam'),
-          ),
-        ],
-      ),
-    );
-  }
-
-  /// POSIX izin metni (ör. "-rw-r--r--"); alınamazsa null.
-  static String? _permissionText(String path) {
-    try {
-      final stat = File(path).statSync();
-      return RootService.modeToString(stat.mode);
-    } catch (_) {
-      return null;
-    }
   }
 
   Future<void> _pickSort() async {
@@ -900,6 +423,24 @@ class _BrowserScreenState extends State<BrowserScreen> {
       ),
     );
   }
+
+  Widget _buildBody(BuildContext context) => buildBrowserBody(
+        context: context,
+        rootPath: widget.rootPath,
+        path: _path,
+        loading: _loading,
+        query: _query,
+        visible: _visible,
+        selected: _selected,
+        selecting: _selecting,
+        highlighted: _highlighted,
+        childCounts: _childCounts,
+        countCap: _countCap,
+        onRefresh: _load,
+        onOpen: _open,
+        onToggleSelect: _toggleSelect,
+        onRowMenu: _rowMenu,
+      );
 
   @override
   Widget build(BuildContext context) {
@@ -981,14 +522,14 @@ class _BrowserScreenState extends State<BrowserScreen> {
             if (!ClipboardManager.instance.isEmpty && !_searchActive)
               IconButton(
                 icon: const Icon(Icons.paste_rounded),
-                onPressed: _paste,
+                onPressed: paste,
                 tooltip: 'Yapıştır',
               ),
             PopupMenuButton<String>(
               onSelected: (value) {
                 switch (value) {
                   case 'new_folder':
-                    _newFolder();
+                    newFolder();
                   case 'refresh':
                     _load();
                   case 'home':
@@ -999,22 +540,60 @@ class _BrowserScreenState extends State<BrowserScreen> {
                         ..clear()
                         ..addAll(_visible.map((e) => e.path));
                     });
+                  case 'toggle_hidden':
+                    final s = context.read<SettingsProvider>();
+                    s.showHiddenFiles = !s.showHiddenFiles;
+                    _load();
                 }
               },
-              itemBuilder: (context) => [
-                const PopupMenuItem(value: 'new_folder', child: Text('Yeni klasör')),
-                const PopupMenuItem(value: 'select_all', child: Text('Tümünü seç')),
-                const PopupMenuItem(value: 'refresh', child: Text('Yenile')),
-                // Breadcrumb kaldırıldığı için "Ana ekran" kısayolu burada.
-                if (widget.showHomeShortcut)
+              itemBuilder: (context) {
+                final s = context.read<SettingsProvider>();
+                return [
                   const PopupMenuItem(
-                      value: 'home', child: Text('Ana ekrana dön')),
-              ],
+                      value: 'new_folder', child: Text('Yeni klasör')),
+                  const PopupMenuItem(
+                      value: 'select_all', child: Text('Tümünü seç')),
+                  const PopupMenuItem(value: 'refresh', child: Text('Yenile')),
+                  if (s.showHideToggleMenu)
+                    PopupMenuItem(
+                      value: 'toggle_hidden',
+                      child: Text(
+                        s.showHiddenFiles
+                            ? 'Gizli dosyaları gizle'
+                            : 'Gizli dosyaları göster',
+                      ),
+                    ),
+                  if (widget.showHomeShortcut)
+                    const PopupMenuItem(
+                        value: 'home', child: Text('Ana ekrana dön')),
+                ];
+              },
             ),
           ] else ...[
             IconButton(
+              icon: Icon(
+                _selected.length == _visible.length && _visible.isNotEmpty
+                    ? Icons.deselect_rounded
+                    : Icons.select_all_rounded,
+              ),
+              tooltip: _selected.length == _visible.length && _visible.isNotEmpty
+                  ? 'Seçimi kaldır'
+                  : 'Tümünü seç',
+              onPressed: () {
+                setState(() {
+                  if (_selected.length == _visible.length) {
+                    _selected.clear();
+                  } else {
+                    _selected
+                      ..clear()
+                      ..addAll(_visible.map((e) => e.path));
+                  }
+                });
+              },
+            ),
+            IconButton(
               icon: const Icon(Icons.copy_rounded),
-              onPressed: () => _copySelectionToClipboard(
+              onPressed: () => copySelectionToClipboard(
                 _entries.where((e) => _selected.contains(e.path)).toList(),
                 cut: false,
               ),
@@ -1022,7 +601,7 @@ class _BrowserScreenState extends State<BrowserScreen> {
             ),
             IconButton(
               icon: const Icon(Icons.content_cut_rounded),
-              onPressed: () => _copySelectionToClipboard(
+              onPressed: () => copySelectionToClipboard(
                 _entries.where((e) => _selected.contains(e.path)).toList(),
                 cut: true,
               ),
@@ -1030,23 +609,23 @@ class _BrowserScreenState extends State<BrowserScreen> {
             ),
             IconButton(
               icon: const Icon(Icons.delete_outline_rounded),
-              onPressed: _deleteSelected,
+              onPressed: deleteSelected,
               tooltip: 'Sil',
             ),
             IconButton(
               icon: const Icon(Icons.share_rounded),
-              onPressed: _shareSelected,
+              onPressed: shareSelected,
               tooltip: 'Paylaş',
             ),
             IconButton(
               icon: const Icon(Icons.archive_outlined),
-              onPressed: _compressSelected,
+              onPressed: compressSelected,
               tooltip: 'Arşive ekle',
             ),
             IconButton(
               icon: const Icon(Icons.drive_file_rename_outline_rounded),
               onPressed: _selected.length == 1
-                  ? () => _rename(_entries
+                  ? () => rename(_entries
                       .where((e) => _selected.contains(e.path))
                       .first)
                   : null,
@@ -1055,7 +634,7 @@ class _BrowserScreenState extends State<BrowserScreen> {
             IconButton(
               icon: const Icon(Icons.info_outline_rounded),
               onPressed: _selected.length == 1
-                  ? () => _showInfo(_entries
+                  ? () => showInfo(_entries
                       .where((e) => _selected.contains(e.path))
                       .first)
                   : null,
@@ -1068,19 +647,71 @@ class _BrowserScreenState extends State<BrowserScreen> {
         children: [
           // Yer tutucu: ListenableBuilder'ı gövdede tutmak için.
           Offstage(child: clipboard),
+          // Açık sekmeler şeridi.
+          ValueListenableBuilder<List<BrowserTab>>(
+            valueListenable: BrowserTabStore.tabs,
+            builder: (context, tabs, _) {
+              if (tabs.isEmpty) return const SizedBox.shrink();
+              return SizedBox(
+                height: 40,
+                child: ListView.separated(
+                  scrollDirection: Axis.horizontal,
+                  padding: const EdgeInsets.symmetric(horizontal: 8),
+                  itemCount: tabs.length,
+                  separatorBuilder: (_, _) => const SizedBox(width: 4),
+                  itemBuilder: (context, i) {
+                    final t = tabs[i];
+                    final selected = t.path == _path ||
+                        t.id == BrowserTabStore.activeId;
+                    return InputChip(
+                      selected: selected,
+                      label: Text(t.title, maxLines: 1),
+                      onSelected: (_) {
+                        BrowserTabStore.select(t.id);
+                        if (t.path == _path) return;
+                        Navigator.of(context).pushReplacement(
+                          MaterialPageRoute(
+                            builder: (_) => BrowserScreen(
+                              title: t.title,
+                              rootPath: t.path,
+                              showHomeShortcut: widget.showHomeShortcut,
+                            ),
+                          ),
+                        );
+                      },
+                      onDeleted: () => BrowserTabStore.close(t.id),
+                    );
+                  },
+                ),
+              );
+            },
+          ),
           // Kök seviye: yol göstergesi + "KULLANILAN %x" rozeti.
           if (widget.showRootDrawer) const RootHeader(),
+          // Derin klasörlerde tıklanabilir yol chip'leri.
+          if (_path.isNotEmpty && _path != _chipRoot)
+            PathChips(
+              rootPath: _chipRoot,
+              currentPath: _path,
+              onNavigate: _navigateToPath,
+            ),
           Expanded(
             child: LayoutBuilder(
               builder: (context, constraints) {
-                // Geniş ekran (tablet): sol klasör ağacı + sağ içerik.
-                if (constraints.maxWidth < 900 || widget.rootPath == null) {
+                final settings = context.watch<SettingsProvider>();
+                final minW = settings.dualPaneMinWidth.toDouble();
+                final dual = widget.rootPath != null &&
+                    (settings.forceDualPane ||
+                        constraints.maxWidth >= minW);
+                if (!dual) {
                   return _buildBody(context);
                 }
+                // Dar telefonda zorla çift bölmede ağaç daraltılır.
+                final treeW = constraints.maxWidth < 720 ? 160.0 : 280.0;
                 return Row(
                   children: [
                     SizedBox(
-                      width: 280,
+                      width: treeW,
                       child: FolderTreePanel(
                         rootPath: widget.rootPath!,
                         currentPath: _path,
@@ -1100,9 +731,9 @@ class _BrowserScreenState extends State<BrowserScreen> {
                             ),
                           );
                         },
-                        // Çift panel: listeden ağaç düğümüne sürüklenen dosya
-                        // kopyalanır (X-plore tarzı).
-                        onDrop: _copyToFolder,
+                        // Çift panel: listeden ağaç düğümüne sürükle →
+                        // kopyala/taşı (ayar veya sor).
+                        onDrop: dropToFolder,
                       ),
                     ),
                     const VerticalDivider(width: 1),
@@ -1114,213 +745,6 @@ class _BrowserScreenState extends State<BrowserScreen> {
           ),
         ],
       ),
-    );
-  }
-
-  Widget _buildBody(BuildContext context) {
-    final datePattern = context.select<SettingsProvider, String>(
-        (s) => s.datePattern);
-    if (widget.rootPath == null || _path.isEmpty) {
-      return const Center(
-        child: Padding(
-          padding: EdgeInsets.all(32),
-          child: Text(
-            'Bu platformda dosya erişimi desteklenmiyor.\n'
-            'Android cihazda tam işlevsellik sunulur.',
-            textAlign: TextAlign.center,
-          ),
-        ),
-      );
-    }
-    if (_loading) return const Center(child: CircularProgressIndicator());
-    final visible = _visible;
-    if (visible.isEmpty) {
-      return Center(
-        child: Text(
-          _query.isEmpty ? 'Boş Klasör' : 'Sonuç bulunamadı',
-          style: Theme.of(context).textTheme.headlineSmall?.copyWith(
-                color: Theme.of(context).colorScheme.outline,
-              ),
-        ),
-      );
-    }
-    return RefreshIndicator(
-      onRefresh: _load,
-      child: context.select<SettingsProvider, String>(
-                (s) => s.browserViewMode) ==
-            'grid'
-          ? _buildGrid(context, visible, datePattern)
-          : _buildList(context, visible, datePattern),
-    );
-  }
-
-  /// Satır görünümü: ikon + ad + (tarih • boyut); uzun bas → seçim,
-  /// sürükle → (tablet) klasör ağacına kopyalama.
-  Widget _buildList(
-    BuildContext context,
-    List<FileEntry> visible,
-    String datePattern,
-  ) {
-    return ListView.builder(
-      itemCount: visible.length,
-      itemBuilder: (context, index) {
-        final e = visible[index];
-        final selected = _selected.contains(e.path);
-        final tile = ListTile(
-          selected: selected,
-          selectedTileColor:
-              Theme.of(context).colorScheme.primary.withValues(alpha: 0.08),
-          // Resim/videoda gerçek küçük resim, klasörde amber klasör + simge,
-          // diğerlerinde renkli tip ikonu.
-          leading: SizedBox(
-            width: 40,
-            height: 40,
-            child: FileThumbnail(entry: e, size: 40),
-          ),
-          title: Text(e.name, maxLines: 1, overflow: TextOverflow.ellipsis),
-          // Referans satır düzeni: klasörde adet ("3 öğe"), dosyada boyut.
-          subtitle: Text(
-            e.isDirectory ? _folderSubtitle(e) : Formats.size(e.size),
-            maxLines: 1,
-            style: Theme.of(context).textTheme.bodySmall?.copyWith(
-                  color: Theme.of(context).colorScheme.outline,
-                ),
-          ),
-          // Sağda tarih + satır menüsü (seçim modunda seçim göstergesi).
-          trailing: _selecting
-              ? Icon(
-                  selected
-                      ? Icons.check_circle_rounded
-                      : Icons.circle_outlined,
-                  color: selected
-                      ? Theme.of(context).colorScheme.primary
-                      : Colors.grey,
-                )
-              : Row(
-                  mainAxisSize: MainAxisSize.min,
-                  children: [
-                    Text(
-                      Formats.date(e.modified, pattern: datePattern),
-                      style: Theme.of(context)
-                          .textTheme
-                          .bodySmall
-                          ?.copyWith(color: Theme.of(context).colorScheme.outline),
-                    ),
-                    IconButton(
-                      icon: const Icon(Icons.more_vert_rounded, size: 20),
-                      tooltip: 'Daha fazla',
-                      onPressed: () => _rowMenu(e),
-                    ),
-                  ],
-                ),
-          onTap: () => _open(e),
-          onLongPress: () => _toggleSelect(e),
-        );
-        // Çift panel (tablet): uzun basıp sürükleyerek sol paneldeki
-        // klasör ağacına kopyalanır; seçiliyken sürüklenemez.
-        if (_selecting) return tile;
-        return LongPressDraggable<String>(
-          data: e.path,
-          feedback: Material(
-            elevation: 4,
-            borderRadius: BorderRadius.circular(8),
-            child: ConstrainedBox(
-              constraints: const BoxConstraints(maxWidth: 240),
-              child: ListTile(
-                dense: true,
-                leading: Icon(e.icon, color: e.color, size: 24),
-                title: Text(e.name,
-                    maxLines: 1, overflow: TextOverflow.ellipsis),
-              ),
-            ),
-          ),
-          childWhenDragging:
-              Opacity(opacity: 0.4, child: tile),
-          child: tile,
-        );
-      },
-    );
-  }
-
-  /// Izgara görünümü: kare önizleme + ad + boyut; fotoğraf/kamera
-  /// klasörlerinde dosyalar kendi görselleriyle görünür.
-  Widget _buildGrid(
-    BuildContext context,
-    List<FileEntry> visible,
-    String datePattern,
-  ) {
-    final width = MediaQuery.sizeOf(context).width;
-    final columns = width > 900 ? 5 : (width > 600 ? 4 : 3);
-    return GridView.builder(
-      padding: const EdgeInsets.all(8),
-      gridDelegate: SliverGridDelegateWithFixedCrossAxisCount(
-        crossAxisCount: columns,
-        mainAxisSpacing: 8,
-        crossAxisSpacing: 8,
-        childAspectRatio: 0.78,
-      ),
-      itemCount: visible.length,
-      itemBuilder: (context, index) {
-        final e = visible[index];
-        final selected = _selected.contains(e.path);
-        return InkWell(
-          borderRadius: BorderRadius.circular(12),
-          onTap: () => _open(e),
-          onLongPress: () => _toggleSelect(e),
-          child: Container(
-            decoration: BoxDecoration(
-              borderRadius: BorderRadius.circular(12),
-              border: selected
-                  ? Border.all(
-                      color: Theme.of(context).colorScheme.primary, width: 2)
-                  : null,
-              color: selected
-                  ? Theme.of(context)
-                      .colorScheme
-                      .primary
-                      .withValues(alpha: 0.08)
-                  : null,
-            ),
-            padding: const EdgeInsets.all(8),
-            child: Column(
-              crossAxisAlignment: CrossAxisAlignment.stretch,
-              children: [
-                // Kare önizleme: genişliğe yayılır, en-boy korunur.
-                Expanded(
-                  child: Center(
-                    child: AspectRatio(
-                      aspectRatio: 1,
-                      child: FileThumbnail(
-                        entry: e,
-                        size: 120,
-                        borderRadius: 10,
-                      ),
-                    ),
-                  ),
-                ),
-                const SizedBox(height: 6),
-                Text(
-                  e.name,
-                  maxLines: 1,
-                  overflow: TextOverflow.ellipsis,
-                  textAlign: TextAlign.center,
-                  style: Theme.of(context).textTheme.bodySmall,
-                ),
-                Text(
-                  e.isDirectory
-                      ? _folderSubtitle(e)
-                      : Formats.size(e.size),
-                  maxLines: 1,
-                  textAlign: TextAlign.center,
-                  style: Theme.of(context).textTheme.labelSmall?.copyWith(
-                        color: Theme.of(context).colorScheme.outline,
-                      ),
-                ),
-              ],
-            ),
-          ),
-        );
-      },
     );
   }
 }

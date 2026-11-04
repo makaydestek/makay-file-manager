@@ -1,11 +1,14 @@
 import 'dart:io';
 
+import 'package:archive/archive.dart' show ArchiveException;
 import 'package:flutter/material.dart';
 import 'package:share_plus/share_plus.dart';
 
 import '../services/archive_service.dart';
+import '../services/transfer.dart';
 import '../theme/app_theme.dart';
 import '../utils/formats.dart';
+import '../widgets/tv_focusable.dart';
 import 'image_viewer_screen.dart';
 import 'text_editor_screen.dart';
 
@@ -43,6 +46,7 @@ class _ArchiveScreenState extends State<ArchiveScreen> {
   bool _loading = true;
   String? _error;
   bool _working = false;
+  String? _password;
 
   String get _fileName =>
       widget.archivePath.split(Platform.pathSeparator).last;
@@ -62,13 +66,45 @@ class _ArchiveScreenState extends State<ArchiveScreen> {
     _load();
   }
 
+  Future<String?> _askPassword() async {
+    final c = TextEditingController();
+    return showDialog<String>(
+      context: context,
+      builder: (context) => AlertDialog(
+        title: const Text('Şifreli arşiv'),
+        content: TextField(
+          controller: c,
+          obscureText: true,
+          decoration: const InputDecoration(
+            labelText: 'Şifre',
+            border: OutlineInputBorder(),
+          ),
+          onSubmitted: (v) => Navigator.pop(context, v),
+        ),
+        actions: [
+          TextButton(
+            onPressed: () => Navigator.pop(context),
+            child: const Text('Vazgeç'),
+          ),
+          FilledButton(
+            onPressed: () => Navigator.pop(context, c.text),
+            child: const Text('Aç'),
+          ),
+        ],
+      ),
+    );
+  }
+
   Future<void> _load() async {
     setState(() {
       _loading = true;
       _error = null;
     });
     try {
-      final entries = await _service.listEntries(widget.archivePath);
+      final entries = await _service.listEntries(
+        widget.archivePath,
+        password: _password,
+      );
       if (!mounted) return;
       setState(() {
         _entries = entries;
@@ -77,11 +113,22 @@ class _ArchiveScreenState extends State<ArchiveScreen> {
       });
     } catch (err) {
       if (!mounted) return;
+      if (ArchiveService.isPasswordError(err) ||
+          (err is ArchiveException &&
+              err.message.toLowerCase().contains('password'))) {
+        final pw = await _askPassword();
+        if (pw != null && pw.isNotEmpty && mounted) {
+          setState(() => _password = pw);
+          await _load();
+          return;
+        }
+      }
+      if (!mounted) return;
       setState(() {
         _error = err is ArchiveServiceException
             ? err.message
-            : 'Arşiv okunamadı. Dosya bozuk ya da desteklenmeyen bir '
-                'formatta olabilir.';
+            : 'Arşiv okunamadı. Dosya bozuk, şifreli ya da desteklenmeyen '
+                'bir formatta olabilir.';
         _loading = false;
       });
     }
@@ -115,6 +162,7 @@ class _ArchiveScreenState extends State<ArchiveScreen> {
     final total = _realEntries.length;
     final progress = ValueNotifier<double>(0);
     final progressText = ValueNotifier<String>('0 / $total');
+    final cancelToken = CancelToken();
     showDialog<void>(
       context: context,
       barrierDismissible: false,
@@ -138,6 +186,12 @@ class _ArchiveScreenState extends State<ArchiveScreen> {
               ),
             ],
           ),
+          actions: [
+            TextButton(
+              onPressed: () => cancelToken.cancel(),
+              child: const Text('İptal'),
+            ),
+          ],
         ),
       ),
     );
@@ -148,11 +202,23 @@ class _ArchiveScreenState extends State<ArchiveScreen> {
         archivePath: widget.archivePath,
         destDir: destDir,
         totalEntries: total,
+        cancelToken: cancelToken,
+        password: _password,
         onProgress: (done, count) {
           progress.value = count > 0 ? done / count : 0;
           progressText.value = count > 0 ? '$done / $count' : '$done';
         },
       );
+    } on TransferCancelled {
+      if (!mounted) return;
+      Navigator.of(context).pop();
+      setState(() => _working = false);
+      ScaffoldMessenger.of(context).showSnackBar(
+        const SnackBar(
+          content: Text('Çıkarma iptal edildi — kısmi dosyalar temizlendi'),
+        ),
+      );
+      return;
     } catch (err) {
       if (!mounted) return;
       Navigator.of(context).pop(); // İlerleme diyaloğu.
@@ -185,6 +251,7 @@ class _ArchiveScreenState extends State<ArchiveScreen> {
         archivePath: widget.archivePath,
         entryName: entry.name,
         destDir: destDir,
+        password: _password,
       );
     } catch (err) {
       if (!mounted) return;
@@ -210,6 +277,7 @@ class _ArchiveScreenState extends State<ArchiveScreen> {
       archivePath: widget.archivePath,
       entryName: entry.name,
       destDir: tempDir.path,
+      password: _password,
     );
     final target = File(
         '${tempDir.path}${Platform.pathSeparator}'
@@ -452,10 +520,13 @@ class _ArchiveScreenState extends State<ArchiveScreen> {
               const SizedBox(height: 12),
               Text(_error!, textAlign: TextAlign.center),
               const SizedBox(height: 16),
-              FilledButton.icon(
-                onPressed: _load,
-                icon: const Icon(Icons.refresh_rounded),
-                label: const Text('Yeniden dene'),
+              TvFocusable(
+                onActivate: _load,
+                child: FilledButton.icon(
+                  onPressed: _load,
+                  icon: const Icon(Icons.refresh_rounded),
+                  label: const Text('Yeniden dene'),
+                ),
               ),
             ],
           ),
@@ -488,31 +559,37 @@ class _ArchiveScreenState extends State<ArchiveScreen> {
       itemBuilder: (context, index) {
         final entry = children[index];
         if (entry.isDirectory) {
-          return ListTile(
-            leading: Icon(Icons.folder_rounded,
-                color: AppTheme.accent, size: 32),
-            title:
-                Text(entry.baseName, maxLines: 1, overflow: TextOverflow.ellipsis),
-            subtitle: Text('${_childCountOf(entry.name)} öğe'),
-            trailing: const Icon(Icons.chevron_right_rounded),
-            onTap: () => setState(() => _currentPath = entry.name),
+          return TvFocusable(
+            onActivate: () => setState(() => _currentPath = entry.name),
+            child: ListTile(
+              leading: Icon(Icons.folder_rounded,
+                  color: AppTheme.accent, size: 32),
+              title: Text(entry.baseName,
+                  maxLines: 1, overflow: TextOverflow.ellipsis),
+              subtitle: Text('${_childCountOf(entry.name)} öğe'),
+              trailing: const Icon(Icons.chevron_right_rounded),
+              onTap: () => setState(() => _currentPath = entry.name),
+            ),
           );
         }
-        return ListTile(
-          leading: Icon(_fileIcon(entry.baseName),
-              color: Theme.of(context).colorScheme.outline, size: 30),
-          title:
-              Text(entry.baseName, maxLines: 1, overflow: TextOverflow.ellipsis),
-          subtitle: Text(entry.compressedSize != entry.uncompressedSize
-              ? '${Formats.size(entry.uncompressedSize)} • sıkıştırılmış '
-                  '${Formats.size(entry.compressedSize)}'
-              : Formats.size(entry.uncompressedSize)),
-          trailing: IconButton(
-            icon: const Icon(Icons.more_vert_rounded, size: 20),
-            tooltip: 'Daha fazla',
-            onPressed: () => _entryMenu(entry),
+        return TvFocusable(
+          onActivate: () => _openEntry(entry),
+          child: ListTile(
+            leading: Icon(_fileIcon(entry.baseName),
+                color: Theme.of(context).colorScheme.outline, size: 30),
+            title: Text(entry.baseName,
+                maxLines: 1, overflow: TextOverflow.ellipsis),
+            subtitle: Text(entry.compressedSize != entry.uncompressedSize
+                ? '${Formats.size(entry.uncompressedSize)} • sıkıştırılmış '
+                    '${Formats.size(entry.compressedSize)}'
+                : Formats.size(entry.uncompressedSize)),
+            trailing: IconButton(
+              icon: const Icon(Icons.more_vert_rounded, size: 20),
+              tooltip: 'Daha fazla',
+              onPressed: () => _entryMenu(entry),
+            ),
+            onTap: () => _openEntry(entry),
           ),
-          onTap: () => _openEntry(entry),
         );
       },
     );
@@ -592,11 +669,15 @@ class _ArchiveScreenState extends State<ArchiveScreen> {
       ),
       bottomNavigationBar: SafeArea(
         minimum: const EdgeInsets.all(12),
-        child: FilledButton.icon(
-          onPressed:
+        child: TvFocusable(
+          onActivate:
               _working || _loading || _error != null ? null : _extractAll,
-          icon: const Icon(Icons.folder_zip_rounded),
-          label: const Text('TÜMÜNÜ ÇIKAR'),
+          child: FilledButton.icon(
+            onPressed:
+                _working || _loading || _error != null ? null : _extractAll,
+            icon: const Icon(Icons.folder_zip_rounded),
+            label: const Text('TÜMÜNÜ ÇIKAR'),
+          ),
         ),
       ),
     );
