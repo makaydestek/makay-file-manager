@@ -49,7 +49,12 @@ void main() {
     File('${smbRoot.path}${Platform.pathSeparator}paylasilan.txt')
         .writeAsStringSync('smb içerik');
     // Port **0** — bkz. yukarıdaki FTP açıklaması.
-    smbServer = MiniSmbServer(rootPath: smbRoot.path, port: 0);
+    smbServer = MiniSmbServer(
+      rootPath: smbRoot.path,
+      port: 0,
+      username: 'makay',
+      password: 'sifre123',
+    );
     await smbServer.start();
     smbPort = smbServer.boundPort;
   });
@@ -139,8 +144,8 @@ void main() {
     await field(tester, 'Port', '$smbPort');
     await field(tester, 'Bağlantı adı', 'Yerel SMB');
     await field(tester, 'Paylaşım adı', 'makay');
-    await field(tester, 'Kullanıcı adı', 'kullanici');
-    await field(tester, 'Şifre', 'sifre');
+    await field(tester, 'Kullanıcı adı', 'makay');
+    await field(tester, 'Şifre', 'sifre123');
 
     await tester.tap(find.widgetWithText(TextButton, 'Test et'));
     final result = await awaitTest(tester);

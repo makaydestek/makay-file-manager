@@ -45,11 +45,13 @@ void main() {
     expect(find.text('192.168.1.50'), findsOneWidget,
         reason: 'Kayıt listeye eklenmeli');
 
-    // 3) SharedPreferences gerçekten yazıldı mı?
+    // 3) SharedPreferences meta yazıldı; şifre düz metin olmamalı.
     final prefs = await SharedPreferences.getInstance();
     final raw = prefs.getString('remote_locations');
     expect(raw, isNotNull, reason: 'remote_locations anahtarı yazılmalı');
     expect(raw, contains('192.168.1.50'));
+    expect(raw, isNot(contains('"password":"sifre"')),
+        reason: 'şifre SecureStore\'da olmalı, prefs\'te değil');
 
     // 4) Store.load() geri okuyabiliyor mu? (asıl kalıcılık kontrolü)
     final loaded = await RemoteLocationStore.load();
@@ -87,7 +89,7 @@ void main() {
 
     await tester.tap(find.byType(FloatingActionButton));
     await tester.pumpAndSettle();
-    await tester.tap(find.text('WebDAV'));
+    await tester.tap(find.text('WebDAV / Nextcloud'));
     await tester.pumpAndSettle();
 
     await tester.enterText(find.widgetWithText(TextFormField, 'Adres (URL)'),
@@ -105,5 +107,60 @@ void main() {
     expect(loaded, hasLength(1));
     expect(loaded.first.type, 'webdav');
     expect(loaded.first.host, startsWith('https://'));
+  });
+
+  testWidgets('Kayıtlı FTP adı yeniden adlandırılabiliyor', (tester) async {
+    SharedPreferences.setMockInitialValues({
+      'remote_locations':
+          '[{"name":"EskiAd","host":"10.0.0.1","type":"ftp","port":21,'
+          '"username":"u","password":"p","startPath":"/","share":""}]',
+    });
+
+    await tester.pumpWidget(const MaterialApp(home: RemoteScreen()));
+    await tester.pumpAndSettle();
+    expect(find.text('EskiAd'), findsOneWidget);
+
+    await tester.tap(find.byTooltip('Düzenle / sil'));
+    await tester.pumpAndSettle();
+    await tester.tap(find.text('Yeniden adlandır'));
+    await tester.pumpAndSettle();
+
+    await tester.enterText(
+        find.widgetWithText(TextField, 'Bağlantı adı'), 'YeniAd');
+    await tester.tap(find.widgetWithText(FilledButton, 'Kaydet'));
+    await tester.pumpAndSettle();
+
+    expect(find.text('YeniAd'), findsOneWidget);
+    expect(find.text('EskiAd'), findsNothing);
+    final loaded = await RemoteLocationStore.load();
+    expect(loaded.single.name, 'YeniAd');
+    expect(loaded.single.host, '10.0.0.1');
+  });
+
+  testWidgets('FTP düzenle formu alanları günceller', (tester) async {
+    SharedPreferences.setMockInitialValues({
+      'remote_locations':
+          '[{"name":"NAS","host":"192.168.1.1","type":"ftp","port":21,'
+          '"username":"u","password":"p","startPath":"/","share":""}]',
+    });
+
+    await tester.pumpWidget(const MaterialApp(home: RemoteScreen()));
+    await tester.pumpAndSettle();
+
+    await tester.tap(find.byTooltip('Düzenle / sil'));
+    await tester.pumpAndSettle();
+    await tester.tap(find.text('Düzenle'));
+    await tester.pumpAndSettle();
+
+    expect(find.text('FTP konumunu düzenle'), findsOneWidget);
+    await tester.enterText(
+        find.widgetWithText(TextFormField, 'Bağlantı adı'), 'Ev NAS');
+    await tester.tap(find.widgetWithText(FilledButton, 'Güncelle'));
+    await tester.pumpAndSettle();
+
+    expect(find.text('Ev NAS'), findsOneWidget);
+    final loaded = await RemoteLocationStore.load();
+    expect(loaded.single.name, 'Ev NAS');
+    expect(loaded.single.host, '192.168.1.1');
   });
 }

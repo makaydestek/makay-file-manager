@@ -741,6 +741,21 @@ ikonlar ve arka plan da seçimle değişmeli.
 regresyon: Klasik, eski görünümün aynısı — turkuaz vurgu, 12px köşe, düz
 zemin).
 
+### A28 — Güvenlik ve Ağ Sertleştirme ✅
+- [x] **SMB NTLMv2 parola doğrulama**: gömülü SMB sunucusu Tip-3 yanıtını
+      gerçek kullanıcı/şifre ile doğrular; yanlış parola
+      `STATUS_LOGON_FAILURE`. Ağdan erişim ekranı FTP ile aynı kimlik
+      bilgisini SMB'ye iletir.
+- [x] **SMB istemci SESSION_SETUP ofset düzeltmesi**: güvenlik tamponu
+      ofseti 0x48 → 0x58 (MS-SMB2 PreviousSessionId sonrası).
+- [x] **SecureStore**: uzak konum şifreleri ve OAuth jetonları
+      `flutter_secure_storage` (Android Keystore) içinde; prefs'ten
+      otomatik migrasyon.
+- [x] **Uygulama kilidi lockout**: kasa ile aynı üstel geri çekilme
+      (0→5→15→60→300→1800 sn) + `auth_service_test`.
+- [x] **FTP salt-okunur + paylaşılan kök**: STOR/DELE/MKD/RMD reddi;
+      Ana bellek / İndirilenler seçimi.
+
 ## Riskler / Notlar
 - **photo_manager KGP uyarısı** (Android build çıktısı): yanlış pozitif —
   `android/gradle.properties` içindeki `android.builtInKotlin=true`
@@ -751,3 +766,5 @@ zemin).
   izni gerekir — Play Store'da kısıtlı, APK yan yüklemeye uygun.
 - Medya okuma için Android 13+ `READ_MEDIA_IMAGES/VIDEO/AUDIO` izinleri A3'te eklenecek.
 - TV platformu ayrı build değil, aynı APK'ya leanback destek + banner eklenir.
+- **Bekleyen**: `browser_screen` parçalama, tam TV odak turu, i18n,
+  kasa akışlı şifreleme (>64 MB), cihaz matrisi hücrelerinin doldurulması.

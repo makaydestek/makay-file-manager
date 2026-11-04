@@ -3,11 +3,15 @@ import 'dart:io';
 import 'dart:math';
 import 'dart:typed_data';
 
+import 'ntlm.dart';
+
 /// Makay Dosya Yöneticisi — gömülü mini SMB2 sunucusu (Windows paylaşımı).
 ///
-/// Saf Dart implementasyonu; SMB 2.0.2 dialeği, salt okunur paylaşım.
-/// NTLM kimlik doğrulama mesajları kabul edilir (her şifre kabul edilir):
-/// yerel ağda pratik "paylaşıma herkes erişebilir" modeli.
+/// Saf Dart implementasyonu; SMB 2.0.2 dialeği. Okuma + yazma (yükleme,
+/// klasör oluşturma, silme, yeniden adlandırma) desteklenir.
+/// NTLMv2 kimlik doğrulama zorunludur ([username] / [password]); yanlış
+/// parola `STATUS_LOGON_FAILURE` ile reddedilir. Yalnızca güvendiğiniz
+/// Wi-Fi'de açın.
 ///
 /// Kullanım (PC'den): `\\<telefon-ip>\makay`
 class MiniSmbServer {
@@ -16,12 +20,20 @@ class MiniSmbServer {
     this.port = 445,
     this.shareName = 'makay',
     this.showHidden = false,
+    this.username = 'admin',
+    this.password = '',
   });
 
   final String rootPath;
   final int port;
   final String shareName;
   final bool showHidden;
+
+  /// NTLMv2 ile doğrulanacak kullanıcı adı (büyük/küçük harf duyarsız).
+  final String username;
+
+  /// NTLMv2 ile doğrulanacak parola. Boş bırakılırsa tüm oturumlar reddedilir.
+  final String password;
 
   // Paylaşımın kozmetik disk bilgisi (Explorer'da görünen alanlar).
   static const int totalUnits = 0x4000000; // 64 GiB / 4 KiB
@@ -93,8 +105,10 @@ const int _cmdCreate = 0x0005;
 const int _cmdClose = 0x0006;
 const int _cmdFlush = 0x0007;
 const int _cmdRead = 0x0008;
+const int _cmdWrite = 0x0009;
 const int _cmdQueryDirectory = 0x000e;
 const int _cmdQueryInfo = 0x0010;
+const int _cmdSetInfo = 0x0011;
 const int _cmdEcho = 0x0013;
 
 const int _statusSuccess = 0x00000000;
@@ -102,6 +116,7 @@ const int _statusEndOfFile = 0xC0000011;
 const int _statusMoreProcessing = 0xC0000016;
 const int _statusAccessDenied = 0xC0000022;
 const int _statusObjectNameNotFound = 0xC0000034;
+const int _statusLogonFailure = 0xC000006D;
 const int _statusNoMoreFiles = 0x80000006;
 const int _statusInvalidParameter = 0xC000000D;
 const int _statusNotSupported = 0xC00000BB;
@@ -121,22 +136,6 @@ final Uint8List _spnegoInit = Uint8List.fromList([
   0x60, 0x1c, 0x06, 0x06, 0x2b, 0x06, 0x01, 0x05, 0x05, 0x02, //
   0xa1, 0x12, 0x30, 0x10, 0xa0, 0x0e, 0x30, 0x0c, //
   ..._ntlmOid,
-]);
-
-/// NTLMSSP Tip-2 (challenge) mesajı: 40 bayt.
-final Uint8List _ntlmChallenge = Uint8List.fromList([
-  0x4e, 0x54, 0x4c, 0x4d, 0x53, 0x53, 0x50, 0x00, // "NTLMSSP\0"
-  0x02, 0x00, 0x00, 0x00, // Tip: 2 (challenge)
-  0x00, 0x00, 0x00, 0x00, 0x30, 0x00, 0x00, 0x00, // hedef ad (boş)
-  0x07, 0x82, 0x0a, 0x00, // bayraklar
-  0xef, 0xcd, 0xab, 0x89, 0x67, 0x45, 0x23, 0x01, // meydan okuma
-  0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, // rezerve
-]);
-
-/// NegTokenResp: SPNEGO sarmalayıcısı içinde NTLM challenge (48 bayt).
-final Uint8List _spnegoChallenge = Uint8List.fromList([
-  0xa1, 0x2e, 0x30, 0x2c, 0xa0, 0x2a, 0x04, 0x28, //
-  ..._ntlmChallenge,
 ]);
 
 // ---------------------------------------------------------------------------
@@ -237,8 +236,9 @@ class _DirItem {
 class _SmbHandle {
   _SmbHandle(this.entity, this.isDir);
 
-  final FileSystemEntity entity;
+  FileSystemEntity entity;
   final bool isDir;
+  bool deleteOnClose = false;
 
   /// Dizin gezinme durumu (QUERY_DIRECTORY imleci).
   List<_DirItem>? listing;
@@ -257,6 +257,8 @@ class _SmbSession {
 
   bool _authenticated = false;
   bool _treeConnected = false;
+  /// Oturuma özel NTLM Tip-2 meydanı (8 bayt); tip-3 doğrulamasında kullanılır.
+  Uint8List? _serverChallenge;
   final _handles = <String, _SmbHandle>{};
 
   Future<void> run() async {
@@ -335,10 +337,14 @@ class _SmbSession {
         return _onCreate(command, messageId, creditCharge, creditReq, r);
       case _cmdRead:
         return _onRead(command, messageId, creditCharge, creditReq, r);
+      case _cmdWrite:
+        return _onWrite(command, messageId, creditCharge, creditReq, r);
       case _cmdQueryDirectory:
         return _onQueryDirectory(command, messageId, creditCharge, creditReq, r);
       case _cmdQueryInfo:
         return _onQueryInfo(command, messageId, creditCharge, creditReq, r);
+      case _cmdSetInfo:
+        return _onSetInfo(command, messageId, creditCharge, creditReq, r);
       case _cmdClose:
         return _onClose(command, messageId, creditCharge, creditReq, r);
       case _cmdFlush:
@@ -442,7 +448,25 @@ class _SmbSession {
 
     final body = _Buf();
     if (ntlmType == 3) {
-      // Tip-3 (authenticate): tüm istekler kabul edilir.
+      final challenge = _serverChallenge;
+      final ok = challenge != null &&
+          server.password.isNotEmpty &&
+          verifyNtlmType3(
+            message: secBuf,
+            serverChallenge: challenge,
+            expectedUsername: server.username,
+            expectedPassword: server.password,
+          );
+      if (!ok) {
+        server._log.add('SMB oturum reddedildi (yanlış kullanıcı/şifre).');
+        body.u16(9);
+        body.u16(0);
+        body.u16(64 + 8);
+        body.u16(0);
+        return _statusMsg(command, _statusLogonFailure, messageId,
+            creditCharge: creditCharge, creditReq: creditReq, sessionId: 0,
+            body: body.take());
+      }
       _authenticated = true;
       body.u16(9);
       body.u16(0); // session flags (guest değil)
@@ -453,12 +477,16 @@ class _SmbSession {
           body: body.take());
     }
 
-    // Faz-1: NTLM meydan okuması.
+    // Faz-1: oturuma özel NTLM Tip-2 meydanı.
+    final challenge = Uint8List.fromList(
+        List.generate(8, (_) => server._random.nextInt(256)));
+    _serverChallenge = challenge;
+    final spnego = spnegoChallengeToken(ntlmType2(challenge));
     body.u16(9);
     body.u16(0);
     body.u16(64 + 8);
-    body.u16(_spnegoChallenge.length);
-    body.bytes(_spnegoChallenge);
+    body.u16(spnego.length);
+    body.bytes(spnego);
     return _statusMsg(command, _statusMoreProcessing, messageId,
         creditCharge: creditCharge, creditReq: creditReq, sessionId: 1,
         body: body.take());
@@ -466,6 +494,10 @@ class _SmbSession {
 
   Uint8List _onTreeConnect(int command, int messageId, int creditCharge,
       int creditReq, _Reader r) {
+    if (!_authenticated) {
+      return _statusMsg(command, _statusAccessDenied, messageId,
+          creditCharge: creditCharge, creditReq: creditReq);
+    }
     r.off = 64;
     r.u16(); // structure size
     r.u16(); // flags
@@ -499,7 +531,7 @@ class _SmbSession {
     r.u32(); // file attributes
     r.u32(); // share access
     final disposition = r.u32();
-    r.u32(); // create options
+    final createOptions = r.u32();
     final nameOffset = r.u16();
     final nameLen = r.u16();
 
@@ -510,33 +542,66 @@ class _SmbSession {
     name = name.replaceAll('/', r'\').replaceAll(RegExp(r'^\\+|\\+$'), '');
     if (name == '.' || name == '..') name = '';
 
-    // Oluşturma/üzerine yazma talepleri: paylaşım salt okunur.
-    if (disposition != 1 /* FILE_OPEN */) {
-      return _statusMsg(command, _statusAccessDenied, messageId,
-          creditCharge: creditCharge, creditReq: creditReq, treeId: 1);
-    }
-
-    FileSystemEntity? entity;
+    final wantDir = (createOptions & 0x1) != 0;
+    String? path;
+    List<String> segments = const [];
     if (name.isEmpty) {
-      entity = Directory(server.rootPath);
+      path = server.rootPath;
     } else {
-      final segments =
+      segments =
           name.split(r'\').where((s) => s.isNotEmpty && s != '.').toList();
       if (segments.any((s) => s == '..')) {
         return _statusMsg(command, _statusObjectNameNotFound, messageId,
             creditCharge: creditCharge, creditReq: creditReq, treeId: 1);
       }
-      final path = '${server.rootPath}${Platform.pathSeparator}'
+      path = '${server.rootPath}${Platform.pathSeparator}'
           '${segments.join(Platform.pathSeparator)}';
-      final type = FileSystemEntity.typeSync(path);
-      if (type == FileSystemEntityType.file) {
-        entity = File(path);
-      } else if (type == FileSystemEntityType.directory) {
-        entity = Directory(path);
-      } else {
-        return _statusMsg(command, _statusObjectNameNotFound, messageId,
+    }
+
+    FileSystemEntity? entity;
+    var createAction = 1; // FILE_OPENED
+    final type = FileSystemEntity.typeSync(path);
+
+    switch (disposition) {
+      case 1: // FILE_OPEN
+        if (type == FileSystemEntityType.file) {
+          entity = File(path);
+        } else if (type == FileSystemEntityType.directory) {
+          entity = Directory(path);
+        } else {
+          return _statusMsg(command, _statusObjectNameNotFound, messageId,
+              creditCharge: creditCharge, creditReq: creditReq, treeId: 1);
+        }
+      case 2: // FILE_CREATE
+        if (type != FileSystemEntityType.notFound) {
+          return _statusMsg(command, _statusAccessDenied, messageId,
+              creditCharge: creditCharge, creditReq: creditReq, treeId: 1);
+        }
+        if (wantDir) {
+          entity = Directory(path)..createSync(recursive: true);
+        } else {
+          Directory(File(path).parent.path).createSync(recursive: true);
+          entity = File(path)..createSync();
+        }
+        createAction = 2; // FILE_CREATED
+      case 5: // FILE_OVERWRITE_IF
+        if (wantDir) {
+          return _statusMsg(command, _statusAccessDenied, messageId,
+              creditCharge: creditCharge, creditReq: creditReq, treeId: 1);
+        }
+        Directory(File(path).parent.path).createSync(recursive: true);
+        final f = File(path);
+        if (f.existsSync()) {
+          f.writeAsBytesSync(const []);
+          createAction = 3; // FILE_OVERWRITTEN
+        } else {
+          f.createSync();
+          createAction = 2;
+        }
+        entity = f;
+      default:
+        return _statusMsg(command, _statusAccessDenied, messageId,
             creditCharge: creditCharge, creditReq: creditReq, treeId: 1);
-      }
     }
 
     final isDir = entity is Directory;
@@ -548,7 +613,7 @@ class _SmbSession {
     body.u16(89);
     body.u8(0); // oplock: yok
     body.u8(0); // flags
-    body.u32(1); // create action: FILE_OPENED
+    body.u32(createAction);
     body.u64(_filetime(stat.changed));
     body.u64(_filetime(stat.accessed));
     body.u64(_filetime(stat.modified));
@@ -556,9 +621,7 @@ class _SmbSession {
     final size = isDir ? 0 : stat.size;
     body.u64(((size + 4095) ~/ 4096) * 4096); // allocation size
     body.u64(size); // end of file
-    body.u32(isDir
-        ? _fileAttrDirectory | _fileAttrReadonly
-        : _fileAttrNormal | _fileAttrReadonly);
+    body.u32(isDir ? _fileAttrDirectory : _fileAttrNormal);
     body.u32(0);
     body.bytes(id);
     body.u32(0); // contexts offset
@@ -566,6 +629,125 @@ class _SmbSession {
     return _statusMsg(command, _statusSuccess, messageId,
         creditCharge: creditCharge, creditReq: creditReq, treeId: 1,
         body: body.take());
+  }
+
+  Uint8List _onWrite(int command, int messageId, int creditCharge,
+      int creditReq, _Reader r) {
+    r.off = 64;
+    r.u16(); // structure size
+    final dataOffset = r.u16();
+    final length = r.u32();
+    final offset = r.u64();
+    final id = r.take(16);
+
+    final handle = _handles[_hex(id)];
+    if (handle == null || handle.isDir || handle.entity is! File) {
+      return _statusMsg(command, _statusAccessDenied, messageId,
+          creditCharge: creditCharge, creditReq: creditReq, treeId: 1);
+    }
+    if (dataOffset + length > r._data.length) {
+      return _statusMsg(command, _statusInvalidParameter, messageId,
+          creditCharge: creditCharge, creditReq: creditReq, treeId: 1);
+    }
+    final data =
+        Uint8List.sublistView(r._data, dataOffset, dataOffset + length);
+    final file = handle.entity as File;
+    // append modu dosyayı silmez; çok parçalı yazmada kritik.
+    final raf = file.openSync(mode: FileMode.append);
+    try {
+      raf.setPositionSync(offset);
+      raf.writeFromSync(data);
+    } finally {
+      raf.closeSync();
+    }
+
+    final body = _Buf();
+    body.u16(17);
+    body.u16(0); // reserved
+    body.u32(length); // count
+    body.u32(0); // remaining
+    body.u16(0); // write channel info offset
+    body.u16(0); // write channel info length
+    return _statusMsg(command, _statusSuccess, messageId,
+        creditCharge: creditCharge, creditReq: creditReq, treeId: 1,
+        body: body.take());
+  }
+
+  Uint8List _onSetInfo(int command, int messageId, int creditCharge,
+      int creditReq, _Reader r) {
+    // MS-SMB2 2.2.39: StructureSize, InfoType, FileInfoClass, BufferLength,
+    // BufferOffset(2), Reserved(2), FileId(16), Buffer.
+    r.off = 64;
+    r.u16(); // structure size
+    final infoType = r.u8();
+    final infoClass = r.u8();
+    final bufferLen = r.u32();
+    final bufferOffset = r.u16();
+    r.u16(); // reserved
+    final id = r.take(16);
+
+    final handle = _handles[_hex(id)];
+    if (handle == null) {
+      return _statusMsg(command, _statusInvalidParameter, messageId,
+          creditCharge: creditCharge, creditReq: creditReq, treeId: 1);
+    }
+    if (infoType != 1) {
+      return _statusMsg(command, _statusNotSupported, messageId,
+          creditCharge: creditCharge, creditReq: creditReq, treeId: 1);
+    }
+    if (bufferOffset + bufferLen > r._data.length) {
+      return _statusMsg(command, _statusInvalidParameter, messageId,
+          creditCharge: creditCharge, creditReq: creditReq, treeId: 1);
+    }
+
+    if (infoClass == 13 && bufferLen >= 1) {
+      // FileDispositionInformation
+      final del = r._data[bufferOffset];
+      if (del != 0) handle.deleteOnClose = true;
+      return _statusMsg(command, _statusSuccess, messageId,
+          creditCharge: creditCharge, creditReq: creditReq, treeId: 1,
+          body: _buf((b) => b.u16(2)));
+    }
+
+    if (infoClass == 10 && bufferLen >= 20) {
+      // FileRenameInformation
+      final nameLen = ByteData.sublistView(r._data)
+          .getUint32(bufferOffset + 16, Endian.little);
+      if (bufferOffset + 20 + nameLen > r._data.length) {
+        return _statusMsg(command, _statusInvalidParameter, messageId,
+            creditCharge: creditCharge, creditReq: creditReq, treeId: 1);
+      }
+      final newName = r.utf16At(bufferOffset + 20, nameLen)
+          .replaceAll('/', r'\')
+          .replaceAll(RegExp(r'^\\+|\\+$'), '');
+      final segments =
+          newName.split(r'\').where((s) => s.isNotEmpty && s != '.').toList();
+      if (segments.isEmpty || segments.any((s) => s == '..')) {
+        return _statusMsg(command, _statusInvalidParameter, messageId,
+            creditCharge: creditCharge, creditReq: creditReq, treeId: 1);
+      }
+      final dest = '${server.rootPath}${Platform.pathSeparator}'
+          '${segments.join(Platform.pathSeparator)}';
+      try {
+        Directory(File(dest).parent.path).createSync(recursive: true);
+        if (handle.isDir) {
+          (handle.entity as Directory).renameSync(dest);
+          handle.entity = Directory(dest);
+        } else {
+          (handle.entity as File).renameSync(dest);
+          handle.entity = File(dest);
+        }
+      } catch (_) {
+        return _statusMsg(command, _statusAccessDenied, messageId,
+            creditCharge: creditCharge, creditReq: creditReq, treeId: 1);
+      }
+      return _statusMsg(command, _statusSuccess, messageId,
+          creditCharge: creditCharge, creditReq: creditReq, treeId: 1,
+          body: _buf((b) => b.u16(2)));
+    }
+
+    return _statusMsg(command, _statusNotSupported, messageId,
+        creditCharge: creditCharge, creditReq: creditReq, treeId: 1);
   }
 
   Uint8List _onRead(int command, int messageId, int creditCharge,
@@ -953,7 +1135,18 @@ class _SmbSession {
     r.u8();
     r.u32();
     final id = r.take(16);
-    _handles.remove(_hex(id));
+    final handle = _handles.remove(_hex(id));
+    if (handle != null && handle.deleteOnClose) {
+      try {
+        if (handle.isDir) {
+          (handle.entity as Directory).deleteSync(recursive: true);
+        } else {
+          (handle.entity as File).deleteSync();
+        }
+      } catch (_) {
+        // Silme hataları kapanışı bozmaz.
+      }
+    }
     final body = _Buf();
     body.u16(24);
     body.u8(0);

@@ -91,7 +91,7 @@ Her satır: **C1 · C2 · C3 · C4 · C5** — uygun değilse `—` işaretlenir
 | 6.4 | Klasör içeren zip | Alt klasör yapısı korunur | | | | | |
 | 6.5 | `..` içeren zararlı zip (Zip-Slip) | **Reddedilir**, hedef dışına yazılmaz | | | | | |
 | 6.6 | Şifreli / bozuk zip | Anlaşılır hata, çökme yok | | | | | |
-| 6.7 | `.rar` / `.7z` | "Desteklenmiyor" mesajı (dürüst uyarı) | | | | | |
+| 6.7 | `.rar` / `.7z` | Android'de native açılır (liste + çıkarma); bozuk/şifreli arşivde anlaşılır hata | | | | | |
 | 6.8 | Seçilen dosyaları zip'e ekle | Klasörde yeni zip oluşur, liste tazelenir | | | | | |
 
 ## 7. Kasa (gizli klasör)
@@ -165,16 +165,35 @@ Her satır: **C1 · C2 · C3 · C4 · C5** — uygun değilse `—` işaretlenir
 
 ---
 
+## Yayın öncesi smoke (zorunlu kısa liste)
+
+Her APK yayını öncesi **en az C3** (veya C1) üzerinde işaretleyin. Tam matris
+ayrıca doldurulur; bu liste kararlılık regresyonunu hızlı yakalar.
+
+| # | Adım | Beklenen | ✓ |
+|---|---|---|---|
+| S1 | Temiz kurulum → sürüm seçimi → izin | Çökme yok, ana ekran açılır | |
+| S2 | Tarayıcıda klasör oluştur / yeniden adlandır / sil | SnackBar başarı veya hata; sessiz fail yok | |
+| S3 | 50+ MB dosya kopyala, iptal et | İlerleme + iptal; çift dosya yok | |
+| S4 | Farklı birime taşı (mümkünse USB/SD) | Kaynak silinemezse **uyarı** SnackBar | |
+| S5 | Bellek Analizi + Geçici Dosyalar aç | UI donmaz; sonuç gelir veya zaman aşımı mesajı | |
+| S6 | Kasa: PIN oluştur, küçük dosya ekle, çıkış/giriş | Açılır; büyük dosya (>64 MB) reddedilir | |
+| S7 | Arşiv çıkar → İptal | Kısmi klasör temizlenir | |
+| S8 | Güncelleme diyaloğı (veya sahte release) | SHA yoksa / uyuşmazsa **kurulum yok** | |
+| S9 | TV veya yatay tablet (varsa) | Odak / çift panel çökmez | |
+
 ## Koşum kaydı
 
 | Sürüm | Tarih | Cihazlar | Sonuç | Notlar |
 |---|---|---|---|---|
+| 1.0.31 | 2026-10-20 | — | ⏳ Bekliyor | Kararlılık sertleştirme (SHA zorunlu, izolat, kasa, arşiv iptal); smoke S1–S9 doldurulacak |
 | 1.0.10 | 2026-10-11 | C3 (emülatör) | ⚠️ Kısmi | Yalnızca otomatik testler koşuldu; cihaz matrisi bu sürümden itibaren uygulanacak |
 
 ## Bilinen kabul edilen sınırlar
 
-- **RAR / 7z okunamaz** — `archive` paketi bu biçimleri desteklemez. Arayüz
-  dürüstçe "desteklenmiyor" der; sessizce başarısız olmaz.
+- **RAR / 7z** — Android'de Junrar + commons-compress (`NativeArchive`) ile
+  okunur/çıkarılır. Diğer platformlarda veya bozuk/şifreli arşivde anlaşılır
+  hata gösterilir.
 - **x86_64 + arm32 + arm64 tek APK** — boyut (~64 MB) üç mimarinin
   `libflutter` + `libapp` kopyalarından gelir. Kullanıcı mimari seçmez;
   bu bilinçli tercihtir.

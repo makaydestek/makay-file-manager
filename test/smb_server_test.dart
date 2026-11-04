@@ -3,6 +3,7 @@ import 'dart:io';
 import 'dart:typed_data';
 
 import 'package:flutter_test/flutter_test.dart';
+import 'package:makay_file_manager/services/ntlm.dart';
 import 'package:makay_file_manager/services/smb_server.dart';
 
 /// Basit SMB2 istemcisi (test amaclı).
@@ -77,17 +78,31 @@ class _SmbTestClient {
   }
 }
 
-Uint8List _ntlm(int type) {
-  final b = ByteData(32 + (type == 3 ? 16 : 0));
-  final u8 = b.buffer.asUint8List();
-  u8.setAll(0, [0x4e, 0x54, 0x4c, 0x4d, 0x53, 0x53, 0x50, 0x00]);
-  b.setUint32(8, type, Endian.little);
-  b.setUint32(12, 0x00088207, Endian.little);
-  return u8;
-}
-
 Uint8List _utf16(String s) =>
     Uint16List.fromList(s.codeUnits).buffer.asUint8List();
+
+Future<void> _auth(_SmbTestClient c,
+    {String user = 'admin', String pass = 'sifre'}) async {
+  await c.request(0x0000, _negotiateBody());
+  final (status1, body1) = await c.request(0x0001, _sessionSetupBody(ntlmType1()));
+  expect(status1, 0xC0000016);
+  // SESSION_SETUP yanıt gövdesi: structureSize(2)+flags(2)+secOffset(2)+secLen(2)+sec
+  final secLen = ByteData.sublistView(body1).getUint16(6, Endian.little);
+  final secOff = ByteData.sublistView(body1).getUint16(4, Endian.little);
+  // secOffset SMB başından; gövde 64'ten sonra → gövde içi ofset = secOff - 64
+  final secStart = secOff - 64;
+  final sec = Uint8List.sublistView(body1, secStart, secStart + secLen);
+  final challenge = NtlmChallenge.parse(sec);
+  final t3 = ntlmType3(
+    username: user,
+    domain: '',
+    workstation: 'TEST',
+    password: pass,
+    challenge: challenge,
+  );
+  final (status2, _) = await c.request(0x0001, _sessionSetupBody(t3));
+  expect(status2, 0);
+}
 
 void main() {
   late MiniSmbServer server;
@@ -103,11 +118,13 @@ void main() {
             '${root.path}${Platform.pathSeparator}klasor${Platform.pathSeparator}ic.txt')
         .writeAsStringSync('icerik');
 
-    // Port **0**: işletim sistemi gerçekten boş bir port tahsis eder. "Boş port
-    // bul → kapat → hemen bağlan" yaklaşımı yarışa açıktı (TOCTOU) ve test
-    // dosyaları paralel koştuğu için başka bir dosya tam o portu alabilirdi.
-    server =
-        MiniSmbServer(rootPath: root.path, port: 0, shareName: 'makay');
+    server = MiniSmbServer(
+      rootPath: root.path,
+      port: 0,
+      shareName: 'makay',
+      username: 'admin',
+      password: 'sifre',
+    );
     await server.start();
     port = server.boundPort;
     expect(server.running, isTrue, reason: 'SMB sunucusu dinlemiyor');
@@ -120,22 +137,9 @@ void main() {
 
   test('SMB2 tam oturum: negotiate, auth, tree, listele, oku', () async {
     final c = await _SmbTestClient.connect(port);
+    await _auth(c);
 
-    // 1) NEGOTIATE
-    final (status, neg) = await c.request(0x0000, _negotiateBody());
-    expect(status, 0);
-    final negBd = ByteData.sublistView(neg);
-    expect(negBd.getUint16(4, Endian.little), 0x0202); // onaylanan dialekt
-
-    // 2) SESSION_SETUP faz-1 (NTLM tip-1) -> MORE_PROCESSING_REQUIRED
-    final (status1, _) = await c.request(0x0001, _sessionSetupBody(_ntlm(1)));
-    expect(status1, 0xC0000016);
-
-    // 3) SESSION_SETUP faz-2 (NTLM tip-3) -> SUCCESS
-    final (status2, _) = await c.request(0x0001, _sessionSetupBody(_ntlm(3)));
-    expect(status2, 0);
-
-    // 4) TREE_CONNECT
+    // TREE_CONNECT
     final path = _utf16(r'\\makay-server\makay');
     final tc = ByteData(8 + path.length);
     final tb = tc.buffer.asUint8List();
@@ -143,67 +147,90 @@ void main() {
     tc.setUint16(4, 72, Endian.little); // path offset (baştan)
     tc.setUint16(6, path.length, Endian.little);
     tb.setAll(8, path);
-    final (status3, _) = await c.request(0x0003, tb);
+    final (status3, _) = await c.request(0x0003, tb, sessionId: 1);
     expect(status3, 0);
 
-    // 5) CREATE: kok dizin
+    // CREATE: kok dizin
     final (status4, createResp) =
-        await c.request(0x0005, _createBody(r''), treeId: 1);
+        await c.request(0x0005, _createBody(r''), treeId: 1, sessionId: 1);
     expect(status4, 0);
     final fileId = Uint8List.sublistView(createResp, 64, 80);
 
-    // 6) QUERY_DIRECTORY: dosyalar gorunmeli
+    // QUERY_DIRECTORY
     final (status5, dirResp) = await c.request(
       0x000E,
       _queryDirBody(fileId),
       treeId: 1,
+      sessionId: 1,
     );
     expect(status5, 0);
     final names = _parseDirEntries(dirResp);
     expect(names, contains('dosya.txt'));
     expect(names, contains('klasor'));
 
-    // 7) CREATE + READ: dosya icerigi
-    final (status6, fileResp) =
-        await c.request(0x0005, _createBody(r'\dosya.txt'), treeId: 1);
+    // CREATE + READ
+    final (status6, fileResp) = await c.request(
+        0x0005, _createBody(r'\dosya.txt'),
+        treeId: 1, sessionId: 1);
     expect(status6, 0);
     final fileId2 = Uint8List.sublistView(fileResp, 64, 80);
-    final (status7, readResp) =
-        await c.request(0x0008, _readBody(fileId2, 128), treeId: 1);
+    final (status7, readResp) = await c.request(
+        0x0008, _readBody(fileId2, 128),
+        treeId: 1, sessionId: 1);
     expect(status7, 0);
     final bd = ByteData.sublistView(readResp);
     final dataLen = bd.getUint32(4, Endian.little);
-    final dataOffset = bd.getUint8(2) - 64; // govde basindan itibaren
+    final dataOffset = bd.getUint8(2) - 64;
     final content = String.fromCharCodes(
         readResp.sublist(dataOffset, dataOffset + dataLen));
     expect(content, 'merhaba makay');
 
-    // 8) Alt klasor gezinmesi.
+    // Alt klasor
     final (status8, subResp) =
-        await c.request(0x0005, _createBody(r'\klasor'), treeId: 1);
+        await c.request(0x0005, _createBody(r'\klasor'), treeId: 1, sessionId: 1);
     expect(status8, 0);
     final fileId3 = Uint8List.sublistView(subResp, 64, 80);
     final (status9, subDir) = await c.request(
       0x000E,
       _queryDirBody(fileId3),
       treeId: 1,
+      sessionId: 1,
     );
     expect(status9, 0);
     expect(_parseDirEntries(subDir), contains('ic.txt'));
 
-    // 9) CLOSE
     final (status10, _) =
-        await c.request(0x0006, _closeBody(fileId2), treeId: 1);
+        await c.request(0x0006, _closeBody(fileId2), treeId: 1, sessionId: 1);
     expect(status10, 0);
 
     await c.close();
   });
 
-  test('SMB2: olmayan dosya OBJECT_NAME_NOT_FOUND doner', () async {
+  test('SMB2: yanlis sifre LOGON_FAILURE doner', () async {
     final c = await _SmbTestClient.connect(port);
     await c.request(0x0000, _negotiateBody());
-    await c.request(0x0001, _sessionSetupBody(_ntlm(1)));
-    await c.request(0x0001, _sessionSetupBody(_ntlm(3)));
+    final (status1, body1) =
+        await c.request(0x0001, _sessionSetupBody(ntlmType1()));
+    expect(status1, 0xC0000016);
+    final secLen = ByteData.sublistView(body1).getUint16(6, Endian.little);
+    final secOff = ByteData.sublistView(body1).getUint16(4, Endian.little);
+    final sec = Uint8List.sublistView(body1, secOff - 64, secOff - 64 + secLen);
+    final challenge = NtlmChallenge.parse(sec);
+    final t3 = ntlmType3(
+      username: 'admin',
+      domain: '',
+      workstation: 'TEST',
+      password: 'yanlis',
+      challenge: challenge,
+    );
+    final (status2, _) = await c.request(0x0001, _sessionSetupBody(t3));
+    expect(status2, 0xC000006D); // STATUS_LOGON_FAILURE
+    await c.close();
+  });
+
+  test('SMB2: olmayan dosya OBJECT_NAME_NOT_FOUND doner', () async {
+    final c = await _SmbTestClient.connect(port);
+    await _auth(c);
     final path = _utf16(r'\\x\makay');
     final tc = ByteData(8 + path.length);
     final tb = tc.buffer.asUint8List();
@@ -211,9 +238,10 @@ void main() {
     tc.setUint16(4, 72, Endian.little);
     tc.setUint16(6, path.length, Endian.little);
     tb.setAll(8, path);
-    await c.request(0x0003, tb);
-    final (status, _) =
-        await c.request(0x0005, _createBody(r'\yok_dosya.txt'), treeId: 1);
+    await c.request(0x0003, tb, sessionId: 1);
+    final (status, _) = await c.request(
+        0x0005, _createBody(r'\yok_dosya.txt'),
+        treeId: 1, sessionId: 1);
     expect(status, 0xC0000034);
     await c.close();
   });

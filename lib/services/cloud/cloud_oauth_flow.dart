@@ -4,6 +4,7 @@ import 'dart:io';
 import 'package:shared_preferences/shared_preferences.dart';
 
 import '../oauth_service.dart';
+import '../secure_store.dart';
 import 'cloud_http_client.dart';
 import 'cloud_types.dart';
 
@@ -92,25 +93,35 @@ class CloudOAuthClient {
 
   /// Yerel oturumu siler (yenileme token'ı da geçersiz olur).
   Future<void> disconnect() async {
+    await SecureStore.delete(tokensKey);
+    // Eski düz metin tercihlerden de temizle.
     final prefs = await SharedPreferences.getInstance();
     await prefs.remove(tokensKey);
   }
 
   Future<void> saveTokens(OAuthSession session) async {
+    final payload = jsonEncode({
+      'access_token': session.accessToken,
+      'refresh_token': session.refreshToken,
+      'expires_at': session.expiresAt.millisecondsSinceEpoch,
+    });
+    await SecureStore.write(tokensKey, payload);
+    // Eski prefs kaydını kaldır (düz metin sızıntısı olmasın).
     final prefs = await SharedPreferences.getInstance();
-    await prefs.setString(
-      tokensKey,
-      jsonEncode({
-        'access_token': session.accessToken,
-        'refresh_token': session.refreshToken,
-        'expires_at': session.expiresAt.millisecondsSinceEpoch,
-      }),
-    );
+    await prefs.remove(tokensKey);
   }
 
   Future<OAuthSession?> loadTokens() async {
-    final prefs = await SharedPreferences.getInstance();
-    final raw = prefs.getString(tokensKey);
+    var raw = await SecureStore.read(tokensKey);
+    if (raw == null || raw.isEmpty) {
+      // Eski sürümlerden migrasyon: SharedPreferences → SecureStore.
+      final prefs = await SharedPreferences.getInstance();
+      raw = prefs.getString(tokensKey);
+      if (raw != null && raw.isNotEmpty) {
+        await SecureStore.write(tokensKey, raw);
+        await prefs.remove(tokensKey);
+      }
+    }
     if (raw == null || raw.isEmpty) return null;
     try {
       final map = jsonDecode(raw) as Map<String, Object?>;

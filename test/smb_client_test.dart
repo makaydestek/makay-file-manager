@@ -39,7 +39,12 @@ void main() {
       );
 
   test('kotu baglanti parametreleri hata firlatir', () async {
-    server = MiniSmbServer(rootPath: root.path, port: port);
+    server = MiniSmbServer(
+      rootPath: root.path,
+      port: port,
+      username: 'kullanici',
+      password: 'sifre',
+    );
     await server.start();
     final bad = loc();
     final client = await SmbClient.connect(bad);
@@ -53,7 +58,12 @@ void main() {
   }, timeout: const Timeout(Duration(seconds: 30)));
 
   test('tam oturum: liste + alt dizin + indirme', () async {
-    server = MiniSmbServer(rootPath: root.path, port: port);
+    server = MiniSmbServer(
+      rootPath: root.path,
+      port: port,
+      username: 'kullanici',
+      password: 'sifre',
+    );
     await server.start();
 
     final client = await SmbClient.connect(loc());
@@ -97,7 +107,12 @@ void main() {
   }, timeout: const Timeout(Duration(seconds: 60)));
 
   test('var olmayan klasor listelenemez', () async {
-    server = MiniSmbServer(rootPath: root.path, port: port);
+    server = MiniSmbServer(
+      rootPath: root.path,
+      port: port,
+      username: 'kullanici',
+      password: 'sifre',
+    );
     await server.start();
     final client = await SmbClient.connect(loc());
     await expectLater(
@@ -106,4 +121,45 @@ void main() {
     );
     await client.close();
   }, timeout: const Timeout(Duration(seconds: 30)));
+
+  test('yazma: mkdir + upload + rename + delete', () async {
+    server = MiniSmbServer(
+      rootPath: root.path,
+      port: port,
+      username: 'kullanici',
+      password: 'sifre',
+    );
+    await server.start();
+    final client = await SmbClient.connect(loc());
+
+    await client.mkdir('yeni');
+    final listed = await client.list('');
+    expect(listed.map((e) => e.name), contains('yeni'));
+
+    final local = File(
+        '${Directory.systemTemp.path}${Platform.pathSeparator}smb_up.txt')
+      ..writeAsStringSync('yuklenen veri');
+    await client.upload(r'yeni\dosya.txt', local);
+
+    final sub = await client.list('yeni');
+    expect(sub.map((e) => e.name), contains('dosya.txt'));
+    final down = File(
+        '${Directory.systemTemp.path}${Platform.pathSeparator}smb_down.txt');
+    await client.download(r'yeni\dosya.txt', down);
+    expect(down.readAsStringSync(), 'yuklenen veri');
+
+    await client.rename(r'yeni\dosya.txt', r'yeni\yeniad.txt');
+    final renamed = await client.list('yeni');
+    expect(renamed.map((e) => e.name), contains('yeniad.txt'));
+    expect(renamed.map((e) => e.name), isNot(contains('dosya.txt')));
+
+    await client.delete(r'yeni\yeniad.txt', isDir: false);
+    await client.delete('yeni', isDir: true);
+    final after = await client.list('');
+    expect(after.map((e) => e.name), isNot(contains('yeni')));
+
+    await client.close();
+    local.deleteSync();
+    down.deleteSync();
+  }, timeout: const Timeout(Duration(seconds: 60)));
 }

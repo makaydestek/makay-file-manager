@@ -8,6 +8,7 @@ import 'package:shared_preferences/shared_preferences.dart';
 import 'cloud/cloud_http_client.dart';
 import 'cloud/cloud_types.dart';
 import 'oauth_service.dart';
+import 'secure_store.dart';
 
 /// Google Drive API hata mesajı.
 class DriveException implements Exception {
@@ -70,8 +71,8 @@ class DriveAccount {
 /// Google Drive REST v3 istemcisi (OAuth 2.0 + PKCE).
 ///
 /// Akış: tarayıcıda Google girişi → döngü arayüzüne dönen kod → token.
-/// Token'lar ve client ID [SharedPreferences] içinde saklanır; erişim
-/// token'ının süresi dolarsa yenileme token'ı ile sessizce yenilenir.
+/// OAuth jetonları [SecureStore]'da; client ID / e-posta prefs'te tutulur.
+/// Erişim token'ının süresi dolarsa yenileme token'ı ile sessizce yenilenir.
 class GoogleDriveService {
   GoogleDriveService._();
 
@@ -108,15 +109,19 @@ class GoogleDriveService {
 
   /// Kullanıcı daha önce bağlandı mı (erişim veya yenileme token'ı var mı)?
   static Future<bool> get hasSession async {
-    final prefs = await SharedPreferences.getInstance();
-    return prefs.getString(_kAccess) != null ||
-        prefs.getString(_kRefresh) != null;
+    await _migrateTokensIfNeeded();
+    final access = await SecureStore.read(_kAccess);
+    final refresh = await SecureStore.read(_kRefresh);
+    return (access != null && access.isNotEmpty) ||
+        (refresh != null && refresh.isNotEmpty);
   }
 
   static Future<String?> accountEmail() async =>
       (await SharedPreferences.getInstance()).getString(_kEmail);
 
   static Future<void> disconnect() async {
+    await SecureStore.delete(_kAccess);
+    await SecureStore.delete(_kRefresh);
     final prefs = await SharedPreferences.getInstance();
     for (final key in [_kAccess, _kRefresh, _kExpiry, _kEmail]) {
       await prefs.remove(key);
@@ -196,12 +201,31 @@ class GoogleDriveService {
   }
 
   static Future<void> _saveSession(OAuthSession session) async {
-    final prefs = await SharedPreferences.getInstance();
-    await prefs.setString(_kAccess, session.accessToken);
+    await SecureStore.write(_kAccess, session.accessToken);
     if (session.refreshToken != null) {
-      await prefs.setString(_kRefresh, session.refreshToken!);
+      await SecureStore.write(_kRefresh, session.refreshToken!);
     }
+    final prefs = await SharedPreferences.getInstance();
     await prefs.setInt(_kExpiry, session.expiresAt.millisecondsSinceEpoch);
+    // Eski düz metin jetonları temizle.
+    await prefs.remove(_kAccess);
+    await prefs.remove(_kRefresh);
+  }
+
+  /// SharedPreferences'taki eski jetonları SecureStore'a taşır (bir kez).
+  static Future<void> _migrateTokensIfNeeded() async {
+    final prefs = await SharedPreferences.getInstance();
+    final legacyAccess = prefs.getString(_kAccess);
+    final legacyRefresh = prefs.getString(_kRefresh);
+    if (legacyAccess == null && legacyRefresh == null) return;
+    if (legacyAccess != null && legacyAccess.isNotEmpty) {
+      await SecureStore.write(_kAccess, legacyAccess);
+      await prefs.remove(_kAccess);
+    }
+    if (legacyRefresh != null && legacyRefresh.isNotEmpty) {
+      await SecureStore.write(_kRefresh, legacyRefresh);
+      await prefs.remove(_kRefresh);
+    }
   }
 
   // -------------------------------------------------------------------------
@@ -209,18 +233,20 @@ class GoogleDriveService {
   // -------------------------------------------------------------------------
 
   static Future<String> _token() async {
+    await _migrateTokensIfNeeded();
     final prefs = await SharedPreferences.getInstance();
-    final access = prefs.getString(_kAccess);
+    final access = await SecureStore.read(_kAccess);
     final expiry = DateTime.fromMillisecondsSinceEpoch(
       prefs.getInt(_kExpiry) ?? 0,
     );
     if (access != null &&
+        access.isNotEmpty &&
         DateTime.now().isBefore(expiry.subtract(const Duration(seconds: 90)))) {
       return access;
     }
-    final refresh = prefs.getString(_kRefresh);
+    final refresh = await SecureStore.read(_kRefresh);
     final id = prefs.getString(_kClientId);
-    if (refresh == null || id == null) {
+    if (refresh == null || refresh.isEmpty || id == null) {
       throw const DriveException('Oturum süresi doldu — tekrar bağlanın.');
     }
     final session = await OAuthService.refresh(

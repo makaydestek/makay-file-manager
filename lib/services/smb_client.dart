@@ -52,10 +52,11 @@ class SmbException implements Exception {
   String toString() => message;
 }
 
-/// Salt okunur SMB2 istemcisi (dialect 2.0.2+, NTLMv2 kimlik doğrulama).
+/// SMB2 istemcisi (dialect 2.0.2+, NTLMv2 kimlik doğrulama).
 ///
 /// Windows/Samba paylaşımlarına bağlanır; paylaşım adı [RemoteLocation.share]
-/// içinde verilir (boşsa `C$` denenir). Yazma işlemleri desteklenmez.
+/// içinde verilir (boşsa `C$` denenir). Listeleme, indirme, yükleme, klasör
+/// oluşturma, silme ve yeniden adlandırma desteklenir.
 class SmbClient {
   SmbClient._(this._socket, this._loc, this._share)
       : _iterator = StreamIterator<List<int>>(_socket);
@@ -70,7 +71,16 @@ class SmbClient {
   int _treeId = 0;
   int _sessionId = 0;
   int _maxRead = 65536;
+  int _maxWrite = 65536;
   bool _closed = false;
+
+  static const _accessRead = 0x00120089; // FILE_GENERIC_READ
+  static const _accessWrite = 0x00120116; // FILE_GENERIC_WRITE
+  static const _accessReadWrite = 0x0012019F; // read|write|delete attributes
+  static const _accessDelete = 0x00010000; // DELETE
+  static const _dispOpen = 1;
+  static const _dispCreate = 2;
+  static const _dispOverwriteIf = 5;
 
   static const _statusSuccess = 0x00000000;
   static const _statusEndOfFile = 0xC0000011;
@@ -82,8 +92,8 @@ class SmbClient {
   static Future<SmbClient> connect(RemoteLocation loc) async {
     final share = loc.share.trim().isEmpty ? r'C$' : loc.share.trim();
     final socket = await Socket.connect(
-      loc.host,
-      loc.port,
+      loc.cleanHost,
+      loc.effectivePort,
       timeout: const Duration(seconds: 15),
     );
     socket.setOption(SocketOption.tcpNoDelay, true);
@@ -209,6 +219,10 @@ class SmbClient {
     }
     final maxRead = bd.getUint32(32, Endian.little);
     _maxRead = (maxRead <= 0 || maxRead > 1 << 20) ? 65536 : maxRead;
+    if (resp.length >= 64 + 40) {
+      final maxWrite = bd.getUint32(36, Endian.little);
+      _maxWrite = (maxWrite <= 0 || maxWrite > 1 << 20) ? 65536 : maxWrite;
+    }
   }
 
   Future<void> _sessionSetup() async {
@@ -219,7 +233,8 @@ class SmbClient {
       body.addByte(0x01); // security mode: signing enabled
       _w32(body, 0); // capabilities
       _w32(body, 0); // channel
-      _w16(body, 0x48); // security buffer offset
+      // MS-SMB2: sabit alanlar 24 bayt → tampon SMB başından 64+24=88.
+      _w16(body, 0x58); // security buffer offset
       _w16(body, blob.length);
       _w64(body, 0); // previous session id
       body.add(blob);
@@ -258,7 +273,7 @@ class SmbClient {
   }
 
   Future<void> _treeConnect() async {
-    final path = '\\\\${_loc.host}\\$_share';
+    final path = '\\\\${_loc.cleanHost}\\$_share';
     final encoded = utf16le(path);
     final body = BytesBuilder();
     _w16(body, 9); // structure size
@@ -275,7 +290,12 @@ class SmbClient {
   /// [path] dizinini listeler ('/' ve '\' ayırt edilir; kök için '' veya '/').
   Future<List<SmbEntry>> list(String path) async {
     final name = _normalize(path);
-    final dirId = await _open(name, isDir: true);
+    final dirId = await _open(
+      name,
+      isDir: true,
+      desiredAccess: _accessRead,
+      disposition: _dispOpen,
+    );
     try {
       final entries = <SmbEntry>[];
       var first = true;
@@ -312,7 +332,12 @@ class SmbClient {
   /// [path] dosyasını yerel [target] dosyasına indirir.
   Future<void> download(String path, File target) async {
     final name = _normalize(path);
-    final id = await _open(name, isDir: false);
+    final id = await _open(
+      name,
+      isDir: false,
+      desiredAccess: _accessRead,
+      disposition: _dispOpen,
+    );
     try {
       final raf = await target.open(mode: FileMode.write);
       try {
@@ -352,6 +377,144 @@ class SmbClient {
     }
   }
 
+  /// Yerel [source] dosyasını uzak [path] konumuna yükler (üzerine yazar).
+  Future<void> upload(String path, File source) async {
+    final name = _normalize(path);
+    final id = await _open(
+      name,
+      isDir: false,
+      desiredAccess: _accessWrite,
+      disposition: _dispOverwriteIf,
+      createOptions: 0x00000040, // FILE_NON_DIRECTORY_FILE
+    );
+    try {
+      final raf = await source.open();
+      try {
+        var offset = 0;
+        while (true) {
+          final chunk = await raf.read(_maxWrite);
+          if (chunk.isEmpty) break;
+          await _write(id, offset, chunk);
+          offset += chunk.length;
+          if (chunk.length < _maxWrite) break;
+        }
+      } finally {
+        await raf.close();
+      }
+    } finally {
+      await _closeHandle(id);
+    }
+  }
+
+  /// Uzak [path] klasörünü oluşturur.
+  Future<void> mkdir(String path) async {
+    final name = _normalize(path);
+    final id = await _open(
+      name,
+      isDir: true,
+      desiredAccess: _accessReadWrite,
+      disposition: _dispCreate,
+      createOptions: 0x00000001, // FILE_DIRECTORY_FILE
+    );
+    await _closeHandle(id);
+  }
+
+  /// Uzak dosya veya klasörü siler.
+  Future<void> delete(String path, {required bool isDir}) async {
+    final name = _normalize(path);
+    final id = await _open(
+      name,
+      isDir: isDir,
+      desiredAccess: _accessDelete | _accessReadWrite,
+      disposition: _dispOpen,
+      createOptions: isDir ? 0x00000001 : 0x00000040,
+    );
+    try {
+      // FileDispositionInformation (info class 13): DeleteFile = 1
+      final info = Uint8List(1)..[0] = 1;
+      final (status, _) = await _setInfo(id, infoClass: 13, buffer: info);
+      _check(status);
+    } finally {
+      await _closeHandle(id);
+    }
+  }
+
+  /// Uzak dosya/klasörü yeniden adlandırır ([from] → [to], tam yollar).
+  Future<void> rename(String from, String to) async {
+    final src = _normalize(from);
+    final dst = _normalize(to);
+    // Kaynak türünü bilmiyoruz; önce dosya, olmazsa klasör dene.
+    Object? last;
+    for (final isDir in [false, true]) {
+      try {
+        final id = await _open(
+          src,
+          isDir: isDir,
+          desiredAccess: _accessDelete | _accessReadWrite,
+          disposition: _dispOpen,
+          createOptions: isDir ? 0x00000001 : 0x00000040,
+        );
+        try {
+          final encoded = utf16le(dst);
+          // FileRenameInformation: ReplaceIfExists(1)+Reserved(7)+Root(8)+Len(4)+Name
+          final info = BytesBuilder();
+          info.addByte(1); // replace if exists
+          info.add(Uint8List(7));
+          _w64(info, 0); // root directory
+          _w32(info, encoded.length);
+          info.add(encoded);
+          final (status, _) =
+              await _setInfo(id, infoClass: 10, buffer: info.takeBytes());
+          _check(status);
+          return;
+        } finally {
+          await _closeHandle(id);
+        }
+      } catch (e) {
+        last = e;
+      }
+    }
+    if (last is SmbException) throw last;
+    throw SmbException('Yeniden adlandırılamadı: $last');
+  }
+
+  /// SMB2 SET_INFO (MS-SMB2 2.2.39).
+  Future<(int, Uint8List)> _setInfo(
+    Uint8List id, {
+    required int infoClass,
+    required List<int> buffer,
+  }) async {
+    final body = BytesBuilder();
+    _w16(body, 33); // structure size
+    body.addByte(1); // SMB2_0_INFO_FILE
+    body.addByte(infoClass);
+    _w32(body, buffer.length);
+    _w16(body, 0x60); // buffer offset (header+32)
+    _w16(body, 0); // reserved
+    body.add(id);
+    // 64 + 28 = 92; 0x60=96 → 4 bayt hizalama.
+    body.add(Uint8List(4));
+    body.add(buffer);
+    return _request(0x0011, body.takeBytes());
+  }
+
+  Future<void> _write(Uint8List id, int offset, List<int> data) async {
+    final body = BytesBuilder();
+    _w16(body, 49); // structure size
+    _w16(body, 0x70); // data offset (header 64 + fixed 48)
+    _w32(body, data.length);
+    _w64(body, offset);
+    body.add(id);
+    _w32(body, 0); // channel
+    _w32(body, 0); // remaining bytes
+    _w16(body, 0); // write channel info offset
+    _w16(body, 0); // write channel info length
+    _w32(body, 0); // flags
+    body.add(data);
+    final (status, _) = await _request(0x0009, body.takeBytes());
+    _check(status);
+  }
+
   /// Oturumu kapatır.
   Future<void> close() async {
     if (_closed) return;
@@ -379,7 +542,13 @@ class SmbClient {
     return p.replaceAll(RegExp(r'^\\+|\\+$'), '');
   }
 
-  Future<Uint8List> _open(String name, {required bool isDir}) async {
+  Future<Uint8List> _open(
+    String name, {
+    required bool isDir,
+    int desiredAccess = _accessRead,
+    int disposition = _dispOpen,
+    int? createOptions,
+  }) async {
     final encoded = utf16le(name);
     final body = BytesBuilder();
     _w16(body, 57); // structure size
@@ -388,11 +557,14 @@ class SmbClient {
     _w32(body, 2); // impersonation level: IMPERSONATION
     _w64(body, 0); // smb create flags
     _w64(body, 0); // reserved
-    _w32(body, 0x00120089); // desired access: FILE_GENERIC_READ
-    _w32(body, 0); // file attributes
+    _w32(body, desiredAccess);
+    _w32(body, isDir ? 0x10 : 0); // file attributes
     _w32(body, 7); // share access: read|write|delete
-    _w32(body, 1); // disposition: FILE_OPEN
-    _w32(body, isDir ? 0x00000001 : 0x00000040); // directory / non-directory
+    _w32(body, disposition);
+    _w32(
+      body,
+      createOptions ?? (isDir ? 0x00000001 : 0x00000040),
+    );
     _w16(body, 120); // name offset (64 + 56)
     _w16(body, encoded.length);
     _w32(body, 0); // contexts offset

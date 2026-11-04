@@ -4,6 +4,8 @@ import 'dart:io';
 import 'package:shared_preferences/shared_preferences.dart';
 import 'package:xml/xml.dart';
 
+import 'secure_store.dart';
+
 /// Bulut konumu (WebDAV tabanlı: Nextcloud, ownCloud, pCloud Drive vb.).
 class CloudLocation {
   CloudLocation({
@@ -20,13 +22,15 @@ class CloudLocation {
   final String username;
   final String password;
 
-  Map<String, Object?> toJson() => {
+  Map<String, Object?> toJson({bool includePassword = false}) => {
         'name': name,
         'provider': provider,
         'url': url,
         'username': username,
-        'password': password,
+        if (includePassword) 'password': password,
       };
+
+  String get secretKey => 'cloud|$provider|$url|$username|$name';
 
   factory CloudLocation.fromJson(Map<String, Object?> json) => CloudLocation(
         name: (json['name'] as String?) ?? '',
@@ -35,11 +39,29 @@ class CloudLocation {
         username: (json['username'] as String?) ?? '',
         password: (json['password'] as String?) ?? '',
       );
+
+  CloudLocation copyWith({
+    String? name,
+    String? provider,
+    String? url,
+    String? username,
+    String? password,
+  }) =>
+      CloudLocation(
+        name: name ?? this.name,
+        provider: provider ?? this.provider,
+        url: url ?? this.url,
+        username: username ?? this.username,
+        password: password ?? this.password,
+      );
 }
 
 /// Bulut konumlarının kalıcı saklayıcısı.
+///
+/// Meta SharedPreferences'ta; parolalar [SecureStore] içinde.
 class CloudLocationStore {
   static const _key = 'cloud_locations';
+  static const _secretsKey = 'cloud_location_secrets_v1';
 
   static Future<List<CloudLocation>> load() async {
     final prefs = await SharedPreferences.getInstance();
@@ -47,10 +69,26 @@ class CloudLocationStore {
     if (raw == null || raw.isEmpty) return [];
     try {
       final list = jsonDecode(raw) as List<Object?>;
-      return list
-          .whereType<Map<String, Object?>>()
-          .map(CloudLocation.fromJson)
-          .toList();
+      final secrets = await _loadSecrets();
+      var migrated = false;
+      final out = <CloudLocation>[];
+      for (final item in list.whereType<Map>()) {
+        final map = Map<String, Object?>.from(item);
+        final loc = CloudLocation.fromJson(map);
+        final legacy = (map['password'] as String?) ?? '';
+        final secure = secrets[loc.secretKey] ?? '';
+        if (legacy.isNotEmpty && secure.isEmpty) {
+          secrets[loc.secretKey] = legacy;
+          migrated = true;
+        }
+        final password = secure.isNotEmpty ? secure : legacy;
+        out.add(password == loc.password ? loc : loc.copyWith(password: password));
+      }
+      if (migrated) {
+        await _saveSecrets(secrets);
+        await save(out);
+      }
+      return out;
     } catch (_) {
       return [];
     }
@@ -59,7 +97,36 @@ class CloudLocationStore {
   static Future<void> save(List<CloudLocation> locations) async {
     final prefs = await SharedPreferences.getInstance();
     await prefs.setString(
-        _key, jsonEncode(locations.map((e) => e.toJson()).toList()));
+      _key,
+      jsonEncode(locations.map((e) => e.toJson()).toList()),
+    );
+    final secrets = <String, String>{
+      for (final loc in locations)
+        if (loc.password.isNotEmpty) loc.secretKey: loc.password,
+    };
+    await _saveSecrets(secrets);
+  }
+
+  static Future<Map<String, String>> _loadSecrets() async {
+    final raw = await SecureStore.read(_secretsKey);
+    if (raw == null || raw.isEmpty) return {};
+    try {
+      final map = jsonDecode(raw) as Map<String, Object?>;
+      return {
+        for (final e in map.entries)
+          if (e.value is String) e.key: e.value as String,
+      };
+    } catch (_) {
+      return {};
+    }
+  }
+
+  static Future<void> _saveSecrets(Map<String, String> secrets) async {
+    if (secrets.isEmpty) {
+      await SecureStore.delete(_secretsKey);
+      return;
+    }
+    await SecureStore.write(_secretsKey, jsonEncode(secrets));
   }
 }
 

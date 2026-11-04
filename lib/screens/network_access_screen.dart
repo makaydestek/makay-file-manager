@@ -1,16 +1,19 @@
 import 'dart:io';
+import 'dart:math';
 
 import 'package:flutter/material.dart';
+import 'package:flutter/services.dart';
 
 import '../services/ftp_server.dart';
 import '../services/smb_server.dart';
 import '../utils/app_paths.dart';
+import '../widgets/tv_focusable.dart';
 
 /// Ağdan erişim ekranı: gömülü FTP/FTPS ve SMB2 sunucularını başlat/durdur.
 ///
 /// Referans uygulamadaki "Ağdan erişim" ekranının karşılığı: sunucu adresi
-/// `ftp://<ip>:6586`, kullanıcı adı `admin`, şifre rastgele (her açılışta
-/// değişir), gizli dosyaları göster, BAŞLAT/DURDUR.
+/// `ftp://<ip>:6586`, kullanıcı adı `admin`, şifre 4 haneli rakam (her
+/// açılışta değişir), gizli dosyaları göster, BAŞLAT/DURDUR.
 class NetworkAccessScreen extends StatefulWidget {
   const NetworkAccessScreen({super.key});
 
@@ -25,12 +28,17 @@ class _NetworkAccessScreenState extends State<NetworkAccessScreen> {
 
   bool _randomPassword = true;
   bool _showHidden = false;
+  bool _readOnly = false;
+
+  /// Paylaşılan kök: 'internal' | 'downloads'
+  String _shareRoot = 'internal';
 
   /// Referans uygulamayla birebir: FTP kullanıcısı `admin`,
-  /// şifre her açılışta rastgele üretilir.
+  /// şifre her açılışta 4 haneli rastgele rakam.
   final _username = 'admin';
   String _password = '';
   String _ipAddress = '…';
+  final _rng = Random.secure();
 
   @override
   void initState() {
@@ -67,16 +75,10 @@ class _NetworkAccessScreenState extends State<NetworkAccessScreen> {
     if (mounted) setState(() => _ipAddress = ip!);
   }
 
+  /// F Dosya Yöneticisi tarzı: kolay yazılır 4 haneli rakam (1000–9999).
   String _generatePassword() {
-    const chars = 'ABCDEFGHJKLMNPQRSTUVWXYZabcdefghijkmnpqrstuvwxyz23456789';
-    final rnd = DateTime.now().microsecondsSinceEpoch;
-    final buf = StringBuffer();
-    var x = rnd;
-    for (var i = 0; i < 10; i++) {
-      x = (x * 1103515245 + 12345) & 0x7fffffff;
-      buf.write(chars[x % chars.length]);
-    }
-    return buf.toString();
+    final n = 1000 + _rng.nextInt(9000);
+    return n.toString();
   }
 
   Future<void> _toggle() async {
@@ -85,14 +87,15 @@ class _NetworkAccessScreenState extends State<NetworkAccessScreen> {
       setState(() {});
       return;
     }
-    final root = await AppPaths.byCategory('internal');
+    final root = await AppPaths.byCategory(_shareRoot);
     final server = MiniFtpServer(
       rootPath: root ?? '/',
       port: 6586,
       tlsPort: 6588,
       username: _username,
-      password: _randomPassword ? _password : _password,
+      password: _password,
       showHidden: _showHidden,
+      readOnly: _readOnly,
     );
     server.log.listen((line) {
       if (!mounted) return;
@@ -119,12 +122,14 @@ class _NetworkAccessScreenState extends State<NetworkAccessScreen> {
       setState(() {});
       return;
     }
-    final root = await AppPaths.byCategory('internal');
+    final root = await AppPaths.byCategory(_shareRoot);
     final server = MiniSmbServer(
       rootPath: root ?? '/',
       port: 445,
       shareName: 'makay',
       showHidden: _showHidden,
+      username: _username,
+      password: _password,
     );
     server.log.listen((line) {
       if (!mounted) return;
@@ -175,7 +180,7 @@ class _NetworkAccessScreenState extends State<NetworkAccessScreen> {
                     contentPadding: EdgeInsets.zero,
                     title: const Text('Rastgele şifre'),
                     subtitle: Text(_randomPassword
-                        ? 'Her açılışta değişir: $_password'
+                        ? 'F Dosya Yöneticisi gibi 4 haneli rakam'
                         : 'Kendi şifrenizi belirleyin'),
                     value: _randomPassword,
                     onChanged: running
@@ -185,12 +190,68 @@ class _NetworkAccessScreenState extends State<NetworkAccessScreen> {
                               if (v) _password = _generatePassword();
                             }),
                   ),
+                  SwitchListTile(
+                    contentPadding: EdgeInsets.zero,
+                    title: const Text('Salt okunur'),
+                    subtitle: const Text(
+                        'FTP üzerinden yükleme/silme/klasör oluşturma kapalı'),
+                    value: _readOnly,
+                    onChanged: running
+                        ? null
+                        : (v) => setState(() => _readOnly = v),
+                  ),
+                  ListTile(
+                    contentPadding: EdgeInsets.zero,
+                    title: const Text('Paylaşılan kök'),
+                    subtitle: Text(_shareRoot == 'downloads'
+                        ? 'İndirilenler klasörü'
+                        : 'Ana bellek (dahili depolama)'),
+                    trailing: DropdownButton<String>(
+                      value: _shareRoot,
+                      onChanged: (running || smbRunning)
+                          ? null
+                          : (v) {
+                              if (v != null) setState(() => _shareRoot = v);
+                            },
+                      items: const [
+                        DropdownMenuItem(
+                            value: 'internal', child: Text('Ana bellek')),
+                        DropdownMenuItem(
+                            value: 'downloads', child: Text('İndirilenler')),
+                      ],
+                    ),
+                  ),
+                  if (_randomPassword)
+                    ListTile(
+                      contentPadding: EdgeInsets.zero,
+                      leading: const Icon(Icons.lock_rounded),
+                      title: Text('Şifre: $_password',
+                          style: theme.textTheme.titleMedium?.copyWith(
+                            fontFamily: 'monospace',
+                            letterSpacing: 4,
+                          )),
+                      trailing: IconButton(
+                        tooltip: 'Kopyala',
+                        icon: const Icon(Icons.copy_rounded),
+                        onPressed: () async {
+                          await Clipboard.setData(
+                              ClipboardData(text: _password));
+                          if (!mounted) return;
+                          ScaffoldMessenger.of(context).showSnackBar(
+                            const SnackBar(
+                                content: Text('Şifre panoya kopyalandı')),
+                          );
+                        },
+                      ),
+                    ),
                   if (!_randomPassword)
                     TextField(
                       decoration: const InputDecoration(
                         labelText: 'Şifre',
                         border: OutlineInputBorder(),
+                        helperText: 'Kısa rakam önerilir (örn. 4 hane)',
                       ),
+                      keyboardType: TextInputType.number,
                       enabled: !running,
                       onChanged: (v) => _password = v,
                     ),
@@ -221,18 +282,21 @@ class _NetworkAccessScreenState extends State<NetworkAccessScreen> {
                     ),
                   ),
                   const SizedBox(height: 8),
-                  SizedBox(
-                    width: double.infinity,
-                    child: FilledButton.icon(
-                      style: running
-                          ? FilledButton.styleFrom(
-                              backgroundColor: theme.colorScheme.error)
-                          : null,
-                      icon: Icon(running
-                          ? Icons.stop_rounded
-                          : Icons.play_arrow_rounded),
-                      label: Text(running ? 'DURDUR' : 'BAŞLAT'),
-                      onPressed: _toggle,
+                  TvFocusable(
+                    onActivate: _toggle,
+                    child: SizedBox(
+                      width: double.infinity,
+                      child: FilledButton.icon(
+                        style: running
+                            ? FilledButton.styleFrom(
+                                backgroundColor: theme.colorScheme.error)
+                            : null,
+                        icon: Icon(running
+                            ? Icons.stop_rounded
+                            : Icons.play_arrow_rounded),
+                        label: Text(running ? 'DURDUR' : 'BAŞLAT'),
+                        onPressed: _toggle,
+                      ),
                     ),
                   ),
                 ],
@@ -246,14 +310,16 @@ class _NetworkAccessScreenState extends State<NetworkAccessScreen> {
               child: Column(
                 crossAxisAlignment: CrossAxisAlignment.start,
                 children: [
-                  Text('SMB2 paylaşımı (Windows)',
+                  Text('SMB2 paylaşımı (Windows — önerilen)',
                       style: theme.textTheme.titleLarge),
                   const SizedBox(height: 8),
                   Text(
-                    'Telefon, Windows/Mac/Linux bilgisayarların ağdaki '
-                    'paylaşımları gibi görünür. Salt okunurdur; hiçbir '
-                    'şifre kabul edilir (yalnızca güvendiğiniz ağda '
-                    'etkinleştirin).',
+                    'Fotoğraf ve dosyaları Windows Fotoğraflar / varsayılan '
+                    'uygulamalarla açmak için bunu kullanın. FTP klasör '
+                    'görünümü dosyaları Edge ile açabilir; SMB normal '
+                    'klasör gibi davranır. NTLMv2 kimlik doğrulama zorunlu '
+                    '(yukarıdaki kullanıcı/şifre). Okuma/yazma açıktır — '
+                    'yalnızca güvendiğiniz Wi-Fi ağında etkinleştirin.',
                     style: theme.textTheme.bodyMedium
                         ?.copyWith(color: theme.colorScheme.outline),
                   ),
@@ -264,23 +330,29 @@ class _NetworkAccessScreenState extends State<NetworkAccessScreen> {
                     title: Text(smbRunning
                         ? 'Paylaşım yolu: \\\\$_ipAddress\\makay'
                         : 'Paylaşım: \\\\IP\\makay (port 445)'),
-                    subtitle: smbRunning
-                        ? const Text('PC: Win+R → \\\\IP\\makay')
-                        : null,
+                    subtitle: Text(
+                      smbRunning
+                          ? 'PC: Win+R → \\\\$_ipAddress\\makay · '
+                              'Kullanıcı: $_username · Şifre: $_password'
+                          : 'Kullanıcı: $_username · Şifre: FTP ile aynı',
+                    ),
                   ),
                   const SizedBox(height: 8),
-                  SizedBox(
-                    width: double.infinity,
-                    child: FilledButton.icon(
-                      style: smbRunning
-                          ? FilledButton.styleFrom(
-                              backgroundColor: theme.colorScheme.error)
-                          : null,
-                      icon: Icon(smbRunning
-                          ? Icons.stop_rounded
-                          : Icons.play_arrow_rounded),
-                      label: Text(smbRunning ? 'DURDUR' : 'BAŞLAT'),
-                      onPressed: _toggleSmb,
+                  TvFocusable(
+                    onActivate: _toggleSmb,
+                    child: SizedBox(
+                      width: double.infinity,
+                      child: FilledButton.icon(
+                        style: smbRunning
+                            ? FilledButton.styleFrom(
+                                backgroundColor: theme.colorScheme.error)
+                            : null,
+                        icon: Icon(smbRunning
+                            ? Icons.stop_rounded
+                            : Icons.play_arrow_rounded),
+                        label: Text(smbRunning ? 'DURDUR' : 'BAŞLAT'),
+                        onPressed: _toggleSmb,
+                      ),
                     ),
                   ),
                 ],
@@ -326,9 +398,12 @@ class _NetworkAccessScreenState extends State<NetworkAccessScreen> {
             child: Padding(
               padding: const EdgeInsets.all(16),
               child: Text(
-                'İpucu: Bilgisayarınızda dosya yöneticisinin "Ağ / FTP" '
-                'bağlantısıyla bu adrese bağlanabilir ya da tarayıcıdan '
-                'ftp://$_ipAddress:6586 adresini ziyaret edebilirsiniz.',
+                'İpucu: Windows\'ta fotoğraf/video açmak için SMB\'yi '
+                'başlatıp Win+R → \\\\$_ipAddress\\makay yazın. '
+                'FTP için Dosya Gezgini adres çubuğuna '
+                'ftp://$_ipAddress:6586 yazın (tarayıcıdan açmayın; '
+                'Edge ile açılır). Kullanıcı: admin · Şifre: yukarıdaki '
+                '4 haneli kod.',
                 style: theme.textTheme.bodySmall
                     ?.copyWith(color: theme.colorScheme.outline),
               ),

@@ -9,7 +9,7 @@ import '../utils/debug_log.dart';
 
 /// Makay Dosya Yöneticisi — gömülü mini FTP sunucusu.
 ///
-/// Saf Dart soket implementasyonu; PASV (pasif) mod desteklidir.
+/// Saf Dart soket implementasyonu; PASV/EPSV (pasif) ve PORT (aktif) destekli.
 /// Ek olarak FTPS (implicit TLS) portu sunar: [tlsPort] üzerinde her
 /// bağlantı şifreli kurulur (FTPS istemcileri için).
 class MiniFtpServer {
@@ -21,10 +21,11 @@ class MiniFtpServer {
     required this.username,
     required this.password,
     this.showHidden = false,
+    this.readOnly = false,
     this.bindAddress,
   });
 
-  /// Sunucunun kök dizini.
+  /// Sunucunun kök dizini (yalnızca bu ağaç görünür).
   final String rootPath;
   final int port;
 
@@ -35,6 +36,9 @@ class MiniFtpServer {
   final String username;
   final String password;
   final bool showHidden;
+
+  /// true ise STOR/DELE/MKD/RMD/RNFR gibi yazma komutları 550 ile reddedilir.
+  final bool readOnly;
 
   /// Sunucunun bağlanacağı arayüz.
   ///
@@ -65,7 +69,7 @@ class MiniFtpServer {
   /// tamamen ortadan kaldırır: port artık seçilmez, **tahsis edilir**.
   int get boundPort => _control?.port ?? port;
 
-  /// FTPT (FTPS) portunun gerçekten dinlendiği port; `tlsPort` `0` verilmişse
+  /// FTPS portunun gerçekten dinlendiği port; `tlsPort` `0` verilmişse
   /// tahsis edilen port.
   int get boundTlsPort => _tlsControl?.port ?? tlsPort;
   final _log = StreamController<String>.broadcast();
@@ -76,13 +80,6 @@ class MiniFtpServer {
 
   /// [body] içinde kurulan dinleyicilerden gelen, `onError`'a ulaşmayan geç
   /// soket hatalarını yutar ve günlüğe yazar.
-  ///
-  /// Gerekçe (CI'da gözlemlendi): Linux'ta `ServerSocket.listen` sonrasında
-  /// gelen bazı hatalar (örn. geçici `Broken pipe`) abonenin `onError`
-  /// geri çağrısına değil, **çağrının kurulduğu bölgeye** (zone) düşer.
-  /// Bölge korumasızsa bu hata süreci — burada testi — beklenmedik biçimde
-  /// düşürür. Dinleyici düzeyindeki bir soket hatası hiçbir zaman süreci
-  /// sonlandırmamalı; günlüğe yazılır.
   void _guardListener(void Function() body) {
     runZonedGuarded<void>(body, (Object e, StackTrace s) {
       _log.add('Dinleyici hatası (yutuldu): $e');
@@ -91,8 +88,6 @@ class MiniFtpServer {
 
   Future<void> start() async {
     if (running) return;
-    // Bağlama hataları bilinçli olarak dışarı bırakılır: sunucu
-    // "başlatılamadı" ise çağıran bunu bilmeli.
     final control = await ServerSocket.bind(_bind, port);
     _control = control;
     _log.add('FTP sunucusu başladı: port ${control.port}');
@@ -127,7 +122,6 @@ class MiniFtpServer {
     _log.add('Sunucu durdu.');
   }
 
-  /// Şifreli bağlantı kabul eder (implicit TLS / FTPS).
   Future<void> _handleTlsClient(Socket raw) async {
     try {
       final secure = await SecureSocket.secureServer(raw, _tlsContext);
@@ -138,11 +132,9 @@ class MiniFtpServer {
     }
   }
 
-  /// Bağlanan istemci oturumu.
   Future<void> _handleClient(Socket socket,
       {bool secureConnection = false}) async {
-    final session =
-        _FtpSession(socket, this, isSecure: secureConnection);
+    final session = _FtpSession(socket, this, isSecure: secureConnection);
     try {
       await session.run();
     } catch (_) {
@@ -179,9 +171,7 @@ class MiniFtpServer {
     return rel.startsWith('/') ? rel : '/$rel';
   }
 
-  /// Dinamik PASV veri portu (kontrol portunun1-38 üstü).
-  /// Dönen port tahmini bir adaydır; bağlanırken [MiniFtpServer]'daki
-  /// yeniden deneme döngüsü dolu portları eleyip sonunda port 0'a düşer.
+  /// Dinamik PASV veri portu (kontrol portunun 1–38 üstü).
   int pickDataPort() => boundPort + 1 + _random.nextInt(38);
 }
 
@@ -201,15 +191,21 @@ class _FtpSession {
   String? user;
   bool authed = false;
   String cwd = '/';
-  _FtpTransfer? transfer;
+
+  /// Aktif (PORT) veri hedefi; PASV kullanılmıyorsa istemci adresi.
+  InternetAddress? _portHost;
+  int? _portPort;
+
   ServerSocket? dataServer;
   Socket? dataSocket;
   Completer<Socket>? _dataReady;
 
   Future<void> run() async {
-    _reply('220 Makay FTP Sunucu hazır');
-    final lines =
-        socket.cast<List<int>>().transform(utf8.decoder).transform(const LineSplitter());
+    await _reply('220 Makay FTP Sunucu hazır');
+    final lines = socket
+        .cast<List<int>>()
+        .transform(utf8.decoder)
+        .transform(const LineSplitter());
     await for (final line in lines) {
       final done = await _handle(line.trim());
       if (done) break;
@@ -217,8 +213,13 @@ class _FtpSession {
     await _cleanupTransfer();
   }
 
-  void _reply(String message) {
+  Future<void> _reply(String message) async {
     socket.write('$message\r\n');
+    // Windows Explorer PASV yanıtını bekler; tamponda kalırsa veri
+    // bağlantısı zaman aşımına düşer ("Sunucuyla bağlantı kurulamadı").
+    try {
+      await socket.flush();
+    } catch (_) {}
   }
 
   Future<bool> _handle(String line) async {
@@ -228,107 +229,119 @@ class _FtpSession {
     final arg = space == -1 ? '' : line.substring(space + 1).trim();
     server._log.add('> $line');
 
-    if (!authed && cmd != 'USER' && cmd != 'PASS' && cmd != 'QUIT') {
-      _reply('530 Lütfen önce giriş yapın.');
+    if (!authed &&
+        cmd != 'USER' &&
+        cmd != 'PASS' &&
+        cmd != 'QUIT' &&
+        cmd != 'NOOP') {
+      await _reply('530 Lütfen önce giriş yapın.');
       return false;
     }
 
     switch (cmd) {
       case 'USER':
         user = arg;
-        _reply('331 Kullanıcı adı alındı, şifre bekleniyor');
+        await _reply('331 Kullanıcı adı alındı, şifre bekleniyor');
       case 'PASS':
         if (user == server.username && arg == server.password) {
           authed = true;
-          _reply('230 Giriş başarılı. Hoş geldiniz.');
+          await _reply('230 Giriş başarılı. Hoş geldiniz.');
         } else {
-          _reply('530 Kullanıcı adı veya şifre hatalı.');
+          await _reply('530 Kullanıcı adı veya şifre hatalı.');
         }
       case 'SYST':
-        _reply('215 UNIX Type: L8');
+        await _reply('215 UNIX Type: L8');
       case 'FEAT':
-        _reply(
-            '211-Özellikler:\n PASV\n UTF8\n SIZE\n MDTM\n REST STREAM\n211 Son');
+        await _reply(
+            '211-Özellikler:\r\n'
+            ' PASV\r\n'
+            ' EPSV\r\n'
+            ' PORT\r\n'
+            ' UTF8\r\n'
+            ' SIZE\r\n'
+            ' MDTM\r\n'
+            ' REST STREAM\r\n'
+            '211 Son');
       case 'PWD':
       case 'XPWD':
-        // cwd zaten sanal yol ('/DCIM' gibi) — doğrudan yazılır.
-        _reply('257 "$cwd" mevcut dizin');
+        await _reply('257 "$cwd" mevcut dizin');
       case 'CWD':
-        final target = server.resolve(
-            arg.startsWith('/') ? arg : '${server.toVirtual(cwd)}/$arg');
+      case 'XCWD':
+        // cwd sanal yoldur; toVirtual(cwd) yanlışlıkla kök'e düşürürdü.
+        final target =
+            server.resolve(arg.startsWith('/') ? arg : '$cwd/$arg');
         if (Directory(target).existsSync()) {
           cwd = server.toVirtual(target);
-          _reply('250 Dizin değiştirildi: $cwd');
+          await _reply('250 Dizin değiştirildi: $cwd');
         } else {
-          _reply('550 Dizin bulunamadı: $arg');
+          await _reply('550 Dizin bulunamadı: $arg');
         }
       case 'CDUP':
-        final parent = cwd == '/' ? '/' : cwd.substring(0, cwd.lastIndexOf('/').clamp(0, cwd.length));
+        final slash = cwd.lastIndexOf('/');
+        final parent =
+            cwd == '/' || slash <= 0 ? '/' : cwd.substring(0, slash);
         cwd = parent.isEmpty ? '/' : parent;
-        _reply('250 Üst dizine çıkıldı: $cwd');
+        await _reply('250 Üst dizine çıkıldı: $cwd');
       case 'TYPE':
-        _reply('200 TYPE $arg kabul edildi');
+        // Her zaman ham bayt (binary) gönderilir; görüntü/video bozulmaz.
+        await _reply('200 TYPE $arg kabul edildi');
       case 'PASV':
-        await _cleanupTransfer();
-        // PASV veri portu tahmin edilemez: seçilen port başka bir süreç
-        // tarafından tutulmuş olabilir (özellikle CI/paralel testlerde).
-        // Bu yüzden birkaç aday denenir; hiçbiri boş değilse işletim
-        // sistemi tahsis eder (port 0) ve **gerçekten dinlenen port**
-        // duyurulur.
-        dataServer = await _bindDataServer();
-        final dataPort = dataServer!.port;
-        // İstemci sunucuya loopback'ten bağlanıyorsa PASV da loopback
-        // sunar; aksi halde aynı cihazdaki veri bağlantısı yerel ağ
-        // arayüzüne gidip güvenlik duvarına takılabilir.
-        final remote = socket.remoteAddress;
-        final host = remote.isLoopback ? '127.0.0.1' : await _localAddress();
-        final parts = host.split('.');
-        final p1 = dataPort >> 8;
-        final p2 = dataPort & 0xFF;
-        _reply(
-            '227 Entering Passive Mode (${parts[0]},${parts[1]},${parts[2]},${parts[3]},$p1,$p2)');
-        _dataReady = Completer<Socket>();
-        dataServer!.listen((s) {
-          dataSocket = s;
-          if (!(_dataReady?.isCompleted ?? true)) {
-            _dataReady!.complete(s);
-          }
-        });
+        await _enterPassive(extended: false);
+      case 'EPSV':
+        await _enterPassive(extended: true);
+      case 'PORT':
+        await _enterActive(arg);
       case 'LIST':
       case 'NLST':
         await _doList(arg, nlst: cmd == 'NLST');
       case 'RETR':
         await _doRetrieve(arg);
       case 'STOR':
-        await _doStore(arg);
+        if (server.readOnly) {
+          await _reply('550 Salt okunur paylaşım — yazma kapalı.');
+        } else {
+          await _doStore(arg);
+        }
       case 'DELE':
+        if (server.readOnly) {
+          await _reply('550 Salt okunur paylaşım — silme kapalı.');
+          break;
+        }
         final f = File(server.resolve(_absolute(arg)));
         if (f.existsSync()) {
           f.deleteSync();
-          _reply('250 Silindi: $arg');
+          await _reply('250 Silindi: $arg');
         } else {
-          _reply('550 Dosya bulunamadı.');
+          await _reply('550 Dosya bulunamadı.');
         }
       case 'MKD':
       case 'XMKD':
+        if (server.readOnly) {
+          await _reply('550 Salt okunur paylaşım — klasör oluşturma kapalı.');
+          break;
+        }
         final d = Directory(server.resolve(_absolute(arg)));
         d.createSync(recursive: true);
-        _reply('257 "${server.toVirtual(d.path)}" oluşturuldu');
+        await _reply('257 "${server.toVirtual(d.path)}" oluşturuldu');
       case 'RMD':
       case 'XRMD':
-        final d = Directory(server.resolve(_absolute(arg)));
-        if (d.existsSync()) {
-          d.deleteSync(recursive: true);
-          _reply('250 Klasör silindi.');
+        if (server.readOnly) {
+          await _reply('550 Salt okunur paylaşım — klasör silme kapalı.');
+          break;
+        }
+        final rd = Directory(server.resolve(_absolute(arg)));
+        if (rd.existsSync()) {
+          rd.deleteSync(recursive: true);
+          await _reply('250 Klasör silindi.');
         } else {
-          _reply('550 Klasör bulunamadı.');
+          await _reply('550 Klasör bulunamadı.');
         }
       case 'SIZE':
         final f = File(server.resolve(_absolute(arg)));
         if (f.existsSync()) {
-          _reply('213 ${f.lengthSync()}');
+          await _reply('213 ${f.lengthSync()}');
         } else {
-          _reply('550 Dosya bulunamadı.');
+          await _reply('550 Dosya bulunamadı.');
         }
       case 'MDTM':
         final f = File(server.resolve(_absolute(arg)));
@@ -337,68 +350,158 @@ class _FtpSession {
           final stamp =
               '${t.year}${t.month.toString().padLeft(2, '0')}${t.day.toString().padLeft(2, '0')}'
               '${t.hour.toString().padLeft(2, '0')}${t.minute.toString().padLeft(2, '0')}${t.second.toString().padLeft(2, '0')}';
-          _reply('213 $stamp');
+          await _reply('213 $stamp');
         } else {
-          _reply('550 Dosya bulunamadı.');
+          await _reply('550 Dosya bulunamadı.');
         }
       case 'OPTS':
-        _reply('200 OK');
+        await _reply('200 OK');
       case 'AUTH':
-        // Açık portta orta seviye yükseltme (explicit AUTH TLS) yerine
-        // dedicated şifreli port kullanılır — daha güvenilir.
         final scheme = arg.toUpperCase();
         if (scheme == 'TLS' || scheme == 'SSL' || scheme == 'TLS-C') {
-          _reply('502 Bu sunucu yalnızca şifreli porttan (FTPS: '
+          await _reply('502 Bu sunucu yalnızca şifreli porttan (FTPS: '
               '${server.boundTlsPort}) bağlantı kabul eder.');
         } else {
-          _reply('504 Desteklenmeyen güvenlik türü: $arg');
+          await _reply('504 Desteklenmeyen güvenlik türü: $arg');
         }
       case 'PBSZ':
-        _reply('200 PBSZ=0');
+        await _reply('200 PBSZ=0');
       case 'PROT':
         final mode = arg.toUpperCase();
         if (mode == 'P') {
           if (isSecure) {
             protPrivate = true;
-            _reply('200 PROT P kabul edildi (veri bağlantısı şifreli)');
+            await _reply('200 PROT P kabul edildi (veri bağlantısı şifreli)');
           } else {
-            _reply(
+            await _reply(
                 '536 PROT P yalnızca şifreli (FTPS) bağlantıda çalışır — '
                 'port ${server.boundTlsPort} kullanın');
           }
         } else {
           protPrivate = false;
-          _reply('200 PROT C kabul edildi');
+          await _reply('200 PROT C kabul edildi');
         }
       case 'NOOP':
-        _reply('200 OK');
+        await _reply('200 OK');
       case 'QUIT':
-        _reply('221 Görüşürüz');
+        await _reply('221 Görüşürüz');
         return true;
       default:
-        _reply('502 Komut desteklenmiyor: $cmd');
+        await _reply('502 Komut desteklenmiyor: $cmd');
     }
     return false;
   }
 
-  String _absolute(String arg) {
-    if (arg.startsWith('/')) return arg;
-    return '${server.toVirtual(cwd)}/$arg';
+  /// PASV/EPSV: önce dinle, sonra yanıtla — aksi halde Windows Explorer
+  /// yanıtı alır almaz bağlanır ve yarış yüzünden kopar.
+  Future<void> _enterPassive({required bool extended}) async {
+    await _cleanupTransfer();
+    dataServer = await _bindDataServer();
+    final dataPort = dataServer!.port;
+    _dataReady = Completer<Socket>();
+    dataServer!.listen(
+      (s) {
+        dataSocket = s;
+        final ready = _dataReady;
+        if (ready != null && !ready.isCompleted) {
+          ready.complete(s);
+        }
+      },
+      onError: (Object e) {
+        final ready = _dataReady;
+        if (ready != null && !ready.isCompleted) {
+          ready.completeError(e);
+        }
+      },
+    );
+    if (extended) {
+      await _reply('229 Entering Extended Passive Mode (|||$dataPort|)');
+      return;
+    }
+    final host = await _pasvHost();
+    final parts = host.split('.');
+    if (parts.length != 4) {
+      await _reply('425 PASV için IPv4 adresi bulunamadı.');
+      await _cleanupTransfer();
+      return;
+    }
+    final p1 = dataPort >> 8;
+    final p2 = dataPort & 0xFF;
+    await _reply(
+        '227 Entering Passive Mode (${parts[0]},${parts[1]},${parts[2]},${parts[3]},$p1,$p2)');
   }
 
-  /// Sunucunun yerel ağ IPv4 adresi (wlan/eth öncelikli).
-  Future<String> _localAddress() async {
+  /// Aktif mod (PORT) — bazı Windows istemcileri PASV başarısız olunca buna düşer.
+  Future<void> _enterActive(String arg) async {
+    await _cleanupTransfer();
+    final parts = arg.split(',');
+    if (parts.length != 6) {
+      await _reply('501 PORT biçimi hatalı.');
+      return;
+    }
+    try {
+      final host = InternetAddress(
+          '${parts[0].trim()}.${parts[1].trim()}.${parts[2].trim()}.${parts[3].trim()}');
+      final p1 = int.parse(parts[4].trim());
+      final p2 = int.parse(parts[5].trim());
+      _portHost = host;
+      _portPort = (p1 << 8) | p2;
+      await _reply('200 PORT komutu başarılı.');
+    } catch (_) {
+      await _reply('501 PORT adresi çözülemedi.');
+    }
+  }
+
+  /// PASV'de duyurulacak IPv4: kontrol soketinin gerçek yerel adresi,
+  /// yoksa istemciyle aynı alt ağdaki arayüz.
+  Future<String> _pasvHost() async {
+    final local = socket.address;
+    if (!local.isLoopback && local.type == InternetAddressType.IPv4) {
+      final a = local.address;
+      if (a != '0.0.0.0') return a;
+    }
+    final remote = socket.remoteAddress;
+    if (remote.isLoopback) return '127.0.0.1';
+    return _localAddress(preferRemote: remote);
+  }
+
+  String _absolute(String arg) {
+    if (arg.startsWith('/')) return arg;
+    if (cwd == '/') return '/$arg';
+    return '$cwd/$arg';
+  }
+
+  /// [preferRemote] verilirse aynı /24 alt ağındaki arayüz tercih edilir
+  /// (VPN/mobil veri IP'sinin duyurulmasını önler).
+  Future<String> _localAddress({InternetAddress? preferRemote}) async {
     try {
       final interfaces = await NetworkInterface.list(
         type: InternetAddressType.IPv4,
         includeLinkLocal: false,
       );
-      // Wi-Fi / ethernet arayüzlerini önceliklendir.
+      final remote = preferRemote?.address;
+      String? remotePrefix;
+      if (remote != null) {
+        final parts = remote.split('.');
+        if (parts.length == 4) {
+          remotePrefix = '${parts[0]}.${parts[1]}.${parts[2]}.';
+        }
+      }
+      if (remotePrefix != null) {
+        for (final i in interfaces) {
+          for (final a in i.addresses) {
+            if (!a.isLoopback && a.address.startsWith(remotePrefix)) {
+              return a.address;
+            }
+          }
+        }
+      }
       for (final i in interfaces) {
         final name = i.name.toLowerCase();
         if (name.contains('wlan') ||
             name.contains('wi-fi') ||
-            name.contains('eth')) {
+            name.contains('eth') ||
+            name.contains('en')) {
           for (final a in i.addresses) {
             if (!a.isLoopback) return a.address;
           }
@@ -418,10 +521,11 @@ class _FtpSession {
   Future<void> _doList(String arg, {bool nlst = false}) async {
     final data = await _acceptData();
     if (data == null) {
-      _reply('425 Veri bağlantısı açılamadı.');
+      await _reply('425 Veri bağlantısı açılamadı.');
       return;
     }
-    _reply(nlst ? '150 Dosya listesi gönderiliyor' : '150 Liste gönderiliyor');
+    await _reply(
+        nlst ? '150 Dosya listesi gönderiliyor' : '150 Liste gönderiliyor');
     final dirPath = arg.isEmpty
         ? server.resolve(cwd)
         : server.resolve(_absolute(arg));
@@ -429,7 +533,6 @@ class _FtpSession {
     final buffer = StringBuffer();
     try {
       for (final e in dir.listSync(followLinks: false)) {
-        // URI'de klasörler sondaki eğik çizgiyle biter → boş segment atlanır.
         final segments =
             e.uri.pathSegments.where((s) => s.isNotEmpty).toList();
         final name = segments.isEmpty
@@ -437,7 +540,7 @@ class _FtpSession {
             : segments.last;
         if (!server.showHidden && name.startsWith('.')) continue;
         if (nlst) {
-          buffer.writeln(name);
+          buffer.write('$name\r\n');
         } else {
           final stat = e.statSync();
           final isDir = e is Directory;
@@ -449,67 +552,94 @@ class _FtpSession {
           ][date.month - 1];
           final stamp =
               '$mon ${date.day.toString().padLeft(2, ' ')} ${date.hour.toString().padLeft(2, '0')}:${date.minute.toString().padLeft(2, '0')}';
-          buffer.writeln(
-              '$perms 1 owner group ${stat.size.toString().padLeft(12)} $stamp $name');
+          buffer.write(
+              '$perms 1 owner group ${stat.size.toString().padLeft(12)} $stamp $name\r\n');
         }
       }
-      data.write(buffer.toString());
+      data.add(utf8.encode(buffer.toString()));
     } catch (_) {
-      _reply('550 Liste alınamadı.');
-    } finally {
+      await _reply('550 Liste alınamadı.');
+      try {
+        await data.close();
+      } catch (_) {}
+      await _cleanupTransfer();
+      return;
+    }
+    try {
       await data.flush();
       await data.close();
-      await _closeDataServer();
-    }
-    _reply('226 Liste tamamlandı');
+    } catch (_) {}
+    await _cleanupTransfer();
+    await _reply('226 Liste tamamlandı');
   }
 
   Future<void> _doRetrieve(String arg) async {
     final file = File(server.resolve(_absolute(arg)));
     if (!file.existsSync()) {
-      _reply('550 Dosya bulunamadı.');
+      await _reply('550 Dosya bulunamadı.');
       return;
     }
     final data = await _acceptData();
     if (data == null) {
-      _reply('425 Veri bağlantısı açılamadı.');
+      await _reply('425 Veri bağlantısı açılamadı.');
       return;
     }
-    _reply('150 Dosya gönderiliyor (${file.lengthSync()} bayt)');
+    await _reply('150 Dosya gönderiliyor (${file.lengthSync()} bayt)');
     try {
       await file.openRead().pipe(data);
-      _reply('226 Transfer tamamlandı');
+      await _reply('226 Transfer tamamlandı');
     } catch (_) {
-      _reply('426 Transfer kesildi');
+      await _reply('426 Transfer kesildi');
     } finally {
-      await data.close();
-      await _closeDataServer();
+      try {
+        await data.close();
+      } catch (_) {}
+      await _cleanupTransfer();
     }
   }
 
   Future<void> _doStore(String arg) async {
     final data = await _acceptData();
     if (data == null) {
-      _reply('425 Veri bağlantısı açılamadı.');
+      await _reply('425 Veri bağlantısı açılamadı.');
       return;
     }
-    _reply('150 Dosya alınıyor');
+    await _reply('150 Dosya alınıyor');
     final file = File(server.resolve(_absolute(arg)));
     try {
       final sink = file.openWrite();
       await data.listen(sink.add).asFuture();
       await sink.flush();
       await sink.close();
-      _reply('226 Transfer tamamlandı');
+      await _reply('226 Transfer tamamlandı');
     } catch (_) {
-      _reply('426 Transfer kesildi');
+      await _reply('426 Transfer kesildi');
     } finally {
-      await data.close();
-      await _closeDataServer();
+      try {
+        await data.close();
+      } catch (_) {}
+      await _cleanupTransfer();
     }
   }
 
   Future<Socket?> _acceptData() async {
+    final activeHost = _portHost;
+    final activePort = _portPort;
+    if (activeHost != null && activePort != null) {
+      _portHost = null;
+      _portPort = null;
+      try {
+        final raw = await Socket.connect(
+          activeHost,
+          activePort,
+          timeout: const Duration(seconds: 15),
+        );
+        return _maybeWrapTls(raw);
+      } catch (_) {
+        return null;
+      }
+    }
+
     final ready = _dataReady;
     if (ready == null || dataServer == null) return null;
     Socket raw;
@@ -518,33 +648,27 @@ class _FtpSession {
     } catch (_) {
       return null;
     }
-    // PROT P: veri bağlantısı da TLS ile kurulur.
-    if (protPrivate) {
-      try {
-        return await SecureSocket.secureServer(
-            raw, MiniFtpServer._tlsContext);
-      } catch (_) {
-        raw.destroy();
-        return null;
-      }
+    return _maybeWrapTls(raw);
+  }
+
+  Future<Socket?> _maybeWrapTls(Socket raw) async {
+    if (!protPrivate) return raw;
+    try {
+      return await SecureSocket.secureServer(raw, MiniFtpServer._tlsContext);
+    } catch (_) {
+      raw.destroy();
+      return null;
     }
-    return raw;
   }
 
   Future<void> _closeDataServer() async {
-    await dataServer?.close();
+    try {
+      await dataServer?.close();
+    } catch (_) {}
     dataServer = null;
   }
 
-  /// PASV veri soketini bağlar.
-  ///
-  /// Aday portlar [MiniFtpServer.pickDataPort] ile sırayla denenir; dolu
-  /// olanlar `SocketException` ile elenir. Hiçbiri boş değilse port `0`
-  /// istenir — işletim sistemi boş bir port tahsis eder ve dinlenen port
-  /// [ServerSocket.port] üzerinden duyurulur. Böylece PASV asla "adres
-  /// kullanımda" ile düşmez.
   Future<ServerSocket> _bindDataServer() async {
-    // Aynı arayüz: veri soketi de sunucunun dinlediği arayüze bağlanır.
     final bind = server._bind;
     const maxCandidates = 8;
     for (var attempt = 0; attempt < maxCandidates; attempt++) {
@@ -561,18 +685,10 @@ class _FtpSession {
     await _closeDataServer();
     try {
       dataSocket?.destroy();
-    } catch (_) {
-      // Soket tarafında zaten kapanmış olabilir; israr etmek oturumu bozar.
-    }
+    } catch (_) {}
     dataSocket = null;
     _dataReady = null;
+    _portHost = null;
+    _portPort = null;
   }
-}
-
-/// Transfer durumu (kullanılmıyor; genişletmeye hazır).
-class _FtpTransfer {
-  _FtpTransfer(this.path, this.isUpload);
-
-  final String path;
-  final bool isUpload;
 }
