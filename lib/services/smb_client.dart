@@ -85,6 +85,7 @@ class SmbClient {
   static const _statusSuccess = 0x00000000;
   static const _statusEndOfFile = 0xC0000011;
   static const _statusMoreProcessing = 0xC0000016;
+  static const _statusBufferOverflow = 0x80000005;
   static const _statusNoMoreFiles = 0x80000006;
   static const _statusNoSuchFile = 0xC000000F;
 
@@ -308,17 +309,25 @@ class SmbClient {
         body.add(dirId);
         _w16(body, 0x60); // file name offset
         _w16(body, 0); // file name length
-        _w32(body, 65536); // output buffer length
+        _w32(body, 1024 * 1024); // output buffer — büyük photo klasörleri
         final (status, resp) = await _request(0x000e, body.takeBytes());
         first = false;
         final st = status & 0xffffffff;
+        // STATUS_NO_MORE_FILES / NO_SUCH_FILE: bitti.
         if (st == _statusNoMoreFiles || st == _statusNoSuchFile) break;
-        _check(status);
+        // STATUS_BUFFER_OVERFLOW: tampon doldu ama veri geçerli — devam et.
+        // (photo gibi büyük medya klasörlerinde eksik/boş listeyi önler)
+        if (st != _statusSuccess && st != _statusBufferOverflow) {
+          _check(status);
+        }
         final bd = ByteData.sublistView(resp);
         // Yanıt gövdesi: StructureSize(2), OutputOffset(2), OutputLength(4), Buffer.
         final dataOffset = bd.getUint16(64 + 2, Endian.little);
         final dataLen = bd.getUint32(64 + 4, Endian.little);
-        if (dataLen == 0) break;
+        if (dataLen == 0) {
+          if (st == _statusBufferOverflow) continue;
+          break;
+        }
         final data =
             Uint8List.sublistView(resp, dataOffset, dataOffset + dataLen);
         entries.addAll(_parseDirEntries(data));
@@ -331,6 +340,27 @@ class SmbClient {
 
   /// [path] dosyasını yerel [target] dosyasına indirir.
   Future<void> download(String path, File target) async {
+    final raf = await target.open(mode: FileMode.write);
+    try {
+      await _readPath(path, (chunk) => raf.writeFrom(chunk));
+    } finally {
+      await raf.close();
+    }
+  }
+
+  /// Dosyayı belleğe indirir (küçük resim önizlemesi için).
+  Future<Uint8List> downloadBytes(String path) async {
+    final builder = BytesBuilder(copy: false);
+    await _readPath(path, (chunk) async {
+      builder.add(chunk);
+    });
+    return builder.takeBytes();
+  }
+
+  Future<void> _readPath(
+    String path,
+    Future<void> Function(Uint8List chunk) onChunk,
+  ) async {
     final name = _normalize(path);
     final id = await _open(
       name,
@@ -339,38 +369,33 @@ class SmbClient {
       disposition: _dispOpen,
     );
     try {
-      final raf = await target.open(mode: FileMode.write);
-      try {
-        var offset = 0;
-        while (true) {
-          final body = BytesBuilder();
-          _w16(body, 49); // structure size
-          body.addByte(0); // padding
-          body.addByte(0); // flags
-          _w32(body, _maxRead);
-          _w64(body, offset);
-          body.add(id);
-          _w32(body, 0); // minimum count
-          _w32(body, 0); // channel
-          _w32(body, 0); // remaining bytes
-          _w16(body, 0); // read channel info length
-          _w16(body, 0); // read channel info offset
-          final (status, resp) = await _request(0x0008, body.takeBytes());
-          final st = status & 0xffffffff;
-          if (st == _statusEndOfFile) break;
-          _check(status);
-          final bd = ByteData.sublistView(resp);
-          final dataOffset = bd.getUint8(64 + 2);
-          final dataLen = bd.getUint32(64 + 4, Endian.little);
-          if (dataLen == 0) break;
-          final data =
-              Uint8List.sublistView(resp, dataOffset, dataOffset + dataLen);
-          await raf.writeFrom(data);
-          offset += dataLen;
-          if (dataLen < _maxRead) break;
-        }
-      } finally {
-        await raf.close();
+      var offset = 0;
+      while (true) {
+        final body = BytesBuilder();
+        _w16(body, 49); // structure size
+        body.addByte(0); // padding
+        body.addByte(0); // flags
+        _w32(body, _maxRead);
+        _w64(body, offset);
+        body.add(id);
+        _w32(body, 0); // minimum count
+        _w32(body, 0); // channel
+        _w32(body, 0); // remaining bytes
+        _w16(body, 0); // read channel info length
+        _w16(body, 0); // read channel info offset
+        final (status, resp) = await _request(0x0008, body.takeBytes());
+        final st = status & 0xffffffff;
+        if (st == _statusEndOfFile) break;
+        _check(status);
+        final bd = ByteData.sublistView(resp);
+        final dataOffset = bd.getUint8(64 + 2);
+        final dataLen = bd.getUint32(64 + 4, Endian.little);
+        if (dataLen == 0) break;
+        final data =
+            Uint8List.sublistView(resp, dataOffset, dataOffset + dataLen);
+        await onChunk(data);
+        offset += dataLen;
+        if (dataLen < _maxRead) break;
       }
     } finally {
       await _closeHandle(id);

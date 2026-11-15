@@ -126,7 +126,7 @@ void main() {
     final dataPort = await c.passive();
     final data = await Socket.connect(InternetAddress.loopbackIPv4, dataPort);
     await c.send('LIST');
-    expect(await c.readReply(), startsWith('150'));
+    expect(await c.readReply(), anyOf(startsWith('125'), startsWith('150')));
     final listing = await utf8.decoder.bind(data).join();
     expect(listing, contains('hello.txt'));
     expect(listing, contains('klasor'));
@@ -136,7 +136,7 @@ void main() {
     final dataPort2 = await c.passive();
     final data2 = await Socket.connect(InternetAddress.loopbackIPv4, dataPort2);
     await c.send('RETR hello.txt');
-    expect(await c.readReply(), startsWith('150'));
+    expect(await c.readReply(), anyOf(startsWith('125'), startsWith('150')));
     final bytes = <int>[];
     await for (final chunk in data2) {
       bytes.addAll(chunk as List<int>);
@@ -180,10 +180,98 @@ void main() {
     final dataPort = int.parse(match.group(1)!);
     final data = await Socket.connect(InternetAddress.loopbackIPv4, dataPort);
     await c.send('NLST');
-    expect(await c.readReply(), startsWith('150'));
+    expect(await c.readReply(), anyOf(startsWith('125'), startsWith('150')));
     final listing = await utf8.decoder.bind(data).join();
     expect(listing, contains('hello.txt'));
     expect(await c.readReply(), startsWith('226'));
+    await c.send('QUIT');
+    await c.close();
+  });
+
+  test('STOR erken veri soketi → 125 (Windows Gezgini / F-FM)', () async {
+    final c = await _FtpTestClient.connect(port);
+    await c.readReply();
+    await c.send('USER android');
+    await c.readReply();
+    await c.send('PASS sifre123');
+    expect(await c.readReply(), startsWith('230'));
+
+    await c.send('ALLO 12');
+    expect(await c.readReply(), startsWith('202'));
+
+    final dataPort = await c.passive();
+    // Gezgin: PASV sonrası hemen veri soketine bağlanır, sonra STOR.
+    final data = await Socket.connect(InternetAddress.loopbackIPv4, dataPort);
+    await Future<void>.delayed(const Duration(milliseconds: 50));
+    await c.send('STOR yuklenen.txt');
+    expect(await c.readReply(), startsWith('125'));
+    data.add(utf8.encode('merhaba stor'));
+    await data.flush();
+    await data.close();
+    expect(await c.readReply(), startsWith('226'));
+
+    final saved = File('${root.path}${Platform.pathSeparator}yuklenen.txt');
+    expect(saved.existsSync(), isTrue);
+    expect(saved.readAsStringSync(), 'merhaba stor');
+
+    await c.send('QUIT');
+    await c.close();
+  });
+
+  test('STOR geç veri soketi → 150 (PASV → STOR → bağlan → FIN)', () async {
+    final c = await _FtpTestClient.connect(port);
+    await c.readReply();
+    await c.send('USER android');
+    await c.readReply();
+    await c.send('PASS sifre123');
+    expect(await c.readReply(), startsWith('230'));
+
+    await c.send('TYPE I');
+    expect(await c.readReply(), startsWith('200'));
+    await c.send('MODE S');
+    expect(await c.readReply(), startsWith('200'));
+    await c.send('STRU F');
+    expect(await c.readReply(), startsWith('200'));
+
+    final dataPort = await c.passive();
+    await c.send('STOR windows.txt');
+    expect(await c.readReply(), startsWith('150'));
+    final data = await Socket.connect(InternetAddress.loopbackIPv4, dataPort);
+    data.add(utf8.encode('gezgin kopya'));
+    await data.flush();
+    await data.close();
+    expect(await c.readReply(), startsWith('226'));
+
+    final saved = File('${root.path}${Platform.pathSeparator}windows.txt');
+    expect(saved.existsSync(), isTrue);
+    expect(saved.readAsStringSync(), 'gezgin kopya');
+
+    await c.send('QUIT');
+    await c.close();
+  });
+
+  test('STOR tırnaklı dosya adı kabul edilir', () async {
+    final c = await _FtpTestClient.connect(port);
+    await c.readReply();
+    await c.send('USER android');
+    await c.readReply();
+    await c.send('PASS sifre123');
+    expect(await c.readReply(), startsWith('230'));
+
+    final dataPort = await c.passive();
+    final data = await Socket.connect(InternetAddress.loopbackIPv4, dataPort);
+    await Future<void>.delayed(const Duration(milliseconds: 50));
+    await c.send('STOR "bos luklu.txt"');
+    expect(await c.readReply(), startsWith('125'));
+    data.add(utf8.encode('ok'));
+    await data.flush();
+    await data.close();
+    expect(await c.readReply(), startsWith('226'));
+
+    final saved =
+        File('${root.path}${Platform.pathSeparator}bos luklu.txt');
+    expect(saved.existsSync(), isTrue);
+
     await c.send('QUIT');
     await c.close();
   });

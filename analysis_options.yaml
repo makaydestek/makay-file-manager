@@ -14,6 +14,8 @@ analyzer:
     - build/**
     - android/**
     - web/**
+    # Geçici keşif/probe betikleri (yayın kodu değil, git'e de girmez).
+    - tool/_probe_*.dart
 
 linter:
   # The lint rules applied to this project can be customized in the

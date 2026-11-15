@@ -12,8 +12,10 @@ import '../services/auth_service.dart';
 import '../services/platform_service.dart';
 import '../services/update_service.dart';
 import '../utils/formats.dart';
+import '../utils/tv_ui.dart';
 import '../widgets/appearance_picker.dart';
 import '../widgets/app_drawer.dart';
+import '../widgets/tv_focusable.dart';
 import '../widgets/update_dialog.dart';
 
 /// Referans uygulamadaki Ayarlar ekranı.
@@ -24,287 +26,471 @@ class SettingsScreen extends StatelessWidget {
   Widget build(BuildContext context) {
     final settings = context.watch<SettingsProvider>();
     final theme = Theme.of(context);
+    final tv = TvUi.enabled(context);
     return Scaffold(
       drawer: const AppDrawer(),
       appBar: AppBar(
           title: Text(AppLocalizations.of(context).settingsTitle)),
-      body: ListView(
-        children: [
-          _sectionHeader(context, 'Genel Ayarlar'),
-          ListTile(
-            title: const Text('Tema'),
-            subtitle: Text(switch (settings.themeMode) {
-              ThemeMode.system => 'Sistem',
-              ThemeMode.light => 'Açık',
-              ThemeMode.dark => 'Koyu',
-            }),
-            leading: const Icon(Icons.palette_rounded),
-            onTap: () => _pickTheme(context, settings),
-          ),
-          ListTile(
-            title: const Text('Görünüm'),
-            subtitle: Text(
-              '${settings.appearance.label} — ${settings.appearance.description}',
+      body: SafeArea(
+        child: ListView(
+          padding: EdgeInsets.only(bottom: tv ? 72 : 24),
+          children: [
+            // TV'de listenin sonu overscan/odak yüzünden kaybolmasın diye
+            // güncelleme + Hakkında en üste alındı.
+            _sectionHeader(context, 'Uygulama'),
+            _UpdateCheckTile(autofocus: tv),
+            const SizedBox(height: 8),
+            _tvItem(
+              child: Padding(
+                padding: const EdgeInsets.fromLTRB(16, 8, 16, 8),
+                child: Text(
+                  'ℹ️ Hakkında',
+                  style: theme.textTheme.titleLarge
+                      ?.copyWith(fontWeight: FontWeight.bold),
+                ),
+              ),
             ),
-            leading: const Icon(Icons.style_rounded),
-            onTap: () => _pickAppearance(context, settings),
-          ),
-          ListTile(
-            title: const Text('Arayüz modu'),
-            subtitle: Text(switch (settings.tvMode) {
-              'tv' => 'TV (kumanda odaklı)',
-              'phone' => 'Telefon / tablet',
-              _ => 'Otomatik (TV algılanırsa TV arayüzü)',
-            }),
-            leading: const Icon(Icons.tv_rounded),
-            onTap: () => _pickUiMode(context, settings),
-          ),
-          ListTile(
-            title: const Text('Görünüm düzeni'),
-            subtitle: Text(switch (settings.viewStyle) {
-              'large' => 'Büyük kartlar (dikey 2 / yatay 3)',
-              'medium' => 'Dengeli (dikey 3 / yatay 4)',
-              'small' => 'Sıkışık (dikey 4 / yatay 6)',
-              _ => 'Otomatik (cihaz genişliğine göre)',
-            }),
-            leading: const Icon(Icons.grid_view_rounded),
-            onTap: () => _pickViewStyle(context, settings),
-          ),
-          ListTile(
-            title: const Text('Ana ekran kartları'),
-            subtitle: Text(
-              'Görünmek istemediğiniz özellikleri gizleyin '
-              '(${kHomeCategories.length - settings.hiddenHomeCategories.length}'
-              ' / ${kHomeCategories.length} görünür)',
+            _tvItem(
+              child: Padding(
+                padding: const EdgeInsets.symmetric(horizontal: 16),
+                child: _aboutCard(context, theme),
+              ),
             ),
-            leading: const Icon(Icons.visibility_rounded),
-            onTap: () => Navigator.of(context).push(
-              MaterialPageRoute(builder: (_) => const HomeCategoriesScreen()),
+            const Divider(),
+            _sectionHeader(context, 'Genel Ayarlar'),
+            _tvItem(
+              onActivate: () => _pickTheme(context, settings),
+              child: ListTile(
+                title: const Text('Tema'),
+                subtitle: Text(switch (settings.themeMode) {
+                  ThemeMode.system => 'Sistem',
+                  ThemeMode.light => 'Açık',
+                  ThemeMode.dark => 'Koyu',
+                }),
+                leading: const Icon(Icons.palette_rounded),
+                onTap: () => _pickTheme(context, settings),
+              ),
             ),
-          ),
-          SwitchListTile(
-            title: const Text('Material You (sistem rengi)'),
-            subtitle: const Text(
-                'Android 12+ cihazlarda uygulama rengini sistemle eşleştir'),
-            secondary: const Icon(Icons.format_color_fill_rounded),
-            value: settings.dynamicColor,
-            onChanged: (v) => settings.dynamicColor = v,
-          ),
-          ListTile(
-            title: const Text('Kasa (gizli klasör)'),
-            subtitle: const Text('PIN ile korunan şifreli dosyalar'),
-            leading: const Icon(Icons.lock_outline_rounded),
-            onTap: () => Navigator.of(context).pushNamed('/vault'),
-          ),
-          ListTile(
-            title: const Text('Bulut bağlantıları'),
-            subtitle: const Text(
-              'Drive / Dropbox / OneDrive / Box — kendi istemci kimliğinizle '
-              '(gelişmiş)',
+            _tvItem(
+              onActivate: () => _pickAppearance(context, settings),
+              child: ListTile(
+                title: const Text('Görünüm'),
+                subtitle: Text(
+                  '${settings.appearance.label} — ${settings.appearance.description}',
+                ),
+                leading: const Icon(Icons.style_rounded),
+                onTap: () => _pickAppearance(context, settings),
+              ),
             ),
-            leading: const Icon(Icons.cloud_rounded),
-            onTap: () => _openCloudAdvanced(context),
-          ),
-          ListTile(
-            title: const Text('Temizlik merkezi'),
-            subtitle: const Text('Öneriler, geçici, mükerrer, büyük dosyalar'),
-            leading: const Icon(Icons.cleaning_services_rounded),
-            onTap: () => Navigator.of(context).pushNamed('/clean'),
-          ),
-          ListTile(
-            title: const Text('USB / SD Kart'),
-            subtitle: const Text('Bağlı harici depolama birimleri'),
-            leading: const Icon(Icons.sd_card_rounded),
-            onTap: () => Navigator.of(context).pushNamed('/usb'),
-          ),
-          ListTile(
-            title: const Text('Mükerrer dosyalar'),
-            subtitle: const Text('Aynı içeriğe sahip kopyaları bul'),
-            leading: const Icon(Icons.copy_all_rounded),
-            onTap: () => Navigator.of(context).pushNamed('/duplicates'),
-          ),
-          ListTile(
-            title: const Text('Gizlilik ve ilkeler'),
-            subtitle: const Text('Reklam yok • Veri toplanmaz • Ücretsiz'),
-            leading: const Icon(Icons.privacy_tip_rounded),
-            onTap: () => Navigator.of(context).pushNamed('/privacy'),
-          ),
-          const Divider(),
-          _sectionHeader(context, 'Güvenlik'),
-          const _AppLockSettings(),
-          const Divider(),
-          _sectionHeader(context, 'Tarayıcı düzeni'),
-          SwitchListTile(
-            title: const Text('Çift bölme (telefon dahil)'),
-            subtitle: const Text(
-              'Açıkken dar ekranda da klasör ağacı + liste yan yana',
+            _tvItem(
+              onActivate: () => _pickLocale(context, settings),
+              child: ListTile(
+                title: const Text('Uygulama dili'),
+                subtitle: Text(switch (settings.localeCode) {
+                  'tr' => 'Türkçe',
+                  'en' => 'English',
+                  _ => 'Cihaz dili (otomatik)',
+                }),
+                leading: const Icon(Icons.translate_rounded),
+                onTap: () => _pickLocale(context, settings),
+              ),
             ),
-            secondary: const Icon(Icons.view_column_rounded),
-            value: settings.forceDualPane,
-            onChanged: (v) => settings.forceDualPane = v,
-          ),
-          ListTile(
-            title: const Text('Çift bölme genişlik eşiği'),
-            subtitle: Text('${settings.dualPaneMinWidth} px'),
-            leading: const Icon(Icons.width_wide_rounded),
-            onTap: () => _pickDualPaneWidth(context, settings),
-          ),
-          ListTile(
-            title: const Text('Sürükle-bırak eylemi'),
-            subtitle: Text(switch (settings.dropAction) {
-              'copy' => 'Her zaman kopyala',
-              'move' => 'Her zaman taşı',
-              _ => 'Her seferinde sor',
-            }),
-            leading: const Icon(Icons.drag_indicator_rounded),
-            onTap: () => _pickDropAction(context, settings),
-          ),
-          ListTile(
-            title: const Text('İzinler'),
-            subtitle: const Text('Tüm erişim izinlerini gör ve değiştir'),
-            leading: const Icon(Icons.shield_rounded),
-            onTap: () => Navigator.of(context).push(
-              MaterialPageRoute(builder: (_) => const PermissionsScreen()),
+            _tvItem(
+              onActivate: () => _pickUiMode(context, settings),
+              child: ListTile(
+                title: const Text('Arayüz modu'),
+                subtitle: Text(switch (settings.tvMode) {
+                  'tv' => 'TV (kumanda odaklı)',
+                  'phone' => 'Telefon / tablet',
+                  _ => 'Otomatik (TV algılanırsa TV arayüzü)',
+                }),
+                leading: const Icon(Icons.tv_rounded),
+                onTap: () => _pickUiMode(context, settings),
+              ),
             ),
-          ),
-          ListTile(
-            title: const Text('Sürüm seçimini göster'),
-            subtitle: const Text('Mobil-Tablet / TV seçim ekranı yeniden açılsın'),
-            leading: const Icon(Icons.restart_alt_rounded),
-            onTap: () {
-              settings.deviceModeChosen = false;
-              // Ana rotaya dönünce _HomeLauncher seçim ekranını açar.
-              Navigator.of(context).popUntil((r) => r.isFirst);
-            },
-          ),
-          ListTile(
-            title: const Text('Varsayılan uygulamalar'),
-            subtitle: const Text('Dosya türleri için varsayılan uygulamalar'),
-            leading: const Icon(Icons.open_in_new_rounded),
-            onTap: () async {
-              final ok = await PlatformService.openDefaultAppsSettings();
-              if (!ok && context.mounted) {
-                ScaffoldMessenger.of(context).showSnackBar(
-                  const SnackBar(content: Text('Ayarlar açılamadı')),
-                );
-              }
-            },
-          ),
-          ListTile(
-            title: const Text('Dahili uygulamalar'),
-            subtitle: const Text('Cihazla gelen (sistem) uygulamalar'),
-            leading: const Icon(Icons.apps_rounded),
-            onTap: () => Navigator.of(context).pushNamed('/apps/system'),
-          ),
-          const Divider(),
-          _sectionHeader(context, 'Diğer ayarlar'),
-          ListTile(
-            title: const Text('Dosya boyutu birimi'),
-            subtitle: Text(settings.sizeUnit),
-            leading: const Icon(Icons.data_object_rounded),
-            onTap: () => _pickSizeUnit(context, settings),
-          ),
-          ListTile(
-            title: const Text('Tarih biçimi'),
-            subtitle: Text(Formats.date(DateTime.now(),
-                pattern: settings.datePattern)),
-            leading: const Icon(Icons.event_rounded),
-            onTap: () => _pickDateFormat(context, settings),
-          ),
-          const Divider(),
-          _sectionHeader(context, 'Geçici dosyalar'),
-          ListTile(
-            title: const Text('Geçici dosyalar'),
-            subtitle: const Text('Önbellek ve geçici dosyaları temizle'),
-            leading: const Icon(Icons.cleaning_services_rounded),
-            onTap: () => Navigator.of(context).pushNamed('/temp'),
-          ),
-          const Divider(),
-          _sectionHeader(context, 'Geri Dönüşüm Kutusu Ayarları'),
-          SwitchListTile(
-            title: const Text('Varsayılan olarak geri dönüşüm kutusu'),
-            subtitle: const Text(
-              'Kapalı: F Dosya Yöneticisi gibi kalıcı siler. '
-              'Açık: silinenleri kutuya taşır',
+            _tvItem(
+              onActivate: () => _pickViewStyle(context, settings),
+              child: ListTile(
+                title: const Text('Görünüm düzeni'),
+                subtitle: Text(switch (settings.viewStyle) {
+                  'large' => 'Büyük kartlar (dikey 2 / yatay 3)',
+                  'medium' => 'Dengeli (dikey 3 / yatay 4)',
+                  'small' => 'Sıkışık (dikey 4 / yatay 6)',
+                  _ => 'Otomatik (cihaz genişliğine göre)',
+                }),
+                leading: const Icon(Icons.grid_view_rounded),
+                onTap: () => _pickViewStyle(context, settings),
+              ),
             ),
-            value: settings.recycleBinDefault,
-            onChanged: (v) => settings.recycleBinDefault = v,
-          ),
-          SwitchListTile(
-            title: const Text('Geri Dönüşüm onayını göster'),
-            value: settings.recycleBinConfirm,
-            onChanged: (v) => settings.recycleBinConfirm = v,
-          ),
-          const Divider(),
-          _sectionHeader(context, 'Bildirim ayarları'),
-          ListTile(
-            title: const Text('Bellek dolu'),
-            subtitle: Text(
-                'Depolama alanı %${settings.storageWarnPercent} dolu olduğunda göster'),
-            leading: const Icon(Icons.notifications_active_rounded),
-            onTap: () => _pickWarnPercent(context, settings),
-          ),
-          const Divider(),
-          _sectionHeader(context, 'Gelişmiş Ayarlar'),
-          SwitchListTile(
-            title: const Text('Nav icon simgesini (≡) her zaman göster'),
-            value: settings.showNavIcon,
-            onChanged: (v) => settings.showNavIcon = v,
-          ),
-          SwitchListTile(
-            title: const Text('USB bağlantısını algıla'),
-            value: settings.detectUsb,
-            onChanged: (v) => settings.detectUsb = v,
-          ),
-          SwitchListTile(
-            title: const Text('Sistem depolamasını göster'),
-            value: settings.showSystemStorage,
-            onChanged: (v) => settings.showSystemStorage = v,
-          ),
-          const Divider(),
-          _sectionHeader(context, 'Gelişmiş menüleri göster'),
-          SwitchListTile(
-            title: const Text('Yer imine ekle'),
-            subtitle: const Text('Klasör satır menüsünde yer imi seçeneği'),
-            value: settings.showBookmarkMenu,
-            onChanged: (v) => settings.showBookmarkMenu = v,
-          ),
-          SwitchListTile(
-            title: const Text('Ana ekrana ekle'),
-            subtitle: const Text('Klasörü cihaz ana ekranına kısayol olarak ekle'),
-            value: settings.showAddToHomeMenu,
-            onChanged: (v) => settings.showAddToHomeMenu = v,
-          ),
-          SwitchListTile(
-            title: const Text('Gizli dosya anahtarı'),
-            subtitle: const Text('Tarayıcı menüsünde gizli dosyaları göster/gizle'),
-            value: settings.showHideToggleMenu,
-            onChanged: (v) => settings.showHideToggleMenu = v,
-          ),
-          SwitchListTile(
-            title: const Text('Farklı aç'),
-            subtitle: const Text('Dosyayı başka uygulamayla açma seçeneği'),
-            value: settings.showOpenWithMenu,
-            onChanged: (v) => settings.showOpenWithMenu = v,
-          ),
-          SwitchListTile(
-            title: const Text('Gizli dosyaları göster'),
-            subtitle: const Text('Nokta ile başlayan dosya ve klasörler'),
-            value: settings.showHiddenFiles,
-            onChanged: (v) => settings.showHiddenFiles = v,
-          ),
-          const Divider(),
-          _aboutHeader(context),
-          _aboutCard(context, theme),
-          ListTile(
-            title: const Text('Güncelleme kontrolü'),
-            subtitle: const Text('GitHub deposunda yeni sürüm var mı bak'),
-            leading: const Icon(Icons.system_update_rounded),
-            onTap: () => _checkUpdate(context),
-          ),
-          const SizedBox(height: 24),
-        ],
+            _tvItem(
+              onActivate: () => Navigator.of(context).push(
+                MaterialPageRoute(
+                    builder: (_) => const HomeCategoriesScreen()),
+              ),
+              child: ListTile(
+                title: const Text('Ana ekran kartları'),
+                subtitle: Text(
+                  'Görünmek istemediğiniz özellikleri gizleyin '
+                  '(${kHomeCategories.length - settings.hiddenHomeCategories.length}'
+                  ' / ${kHomeCategories.length} görünür)',
+                ),
+                leading: const Icon(Icons.visibility_rounded),
+                onTap: () => Navigator.of(context).push(
+                  MaterialPageRoute(
+                      builder: (_) => const HomeCategoriesScreen()),
+                ),
+              ),
+            ),
+            _tvItem(
+              onActivate: () =>
+                  settings.dynamicColor = !settings.dynamicColor,
+              child: SwitchListTile(
+                title: const Text('Material You (sistem rengi)'),
+                subtitle: const Text(
+                    'Android 12+ cihazlarda uygulama rengini sistemle eşleştir'),
+                secondary: const Icon(Icons.format_color_fill_rounded),
+                value: settings.dynamicColor,
+                onChanged: (v) => settings.dynamicColor = v,
+              ),
+            ),
+            _tvItem(
+              onActivate: () => Navigator.of(context).pushNamed('/vault'),
+              child: ListTile(
+                title: const Text('Kasa (gizli klasör)'),
+                subtitle: const Text('PIN ile korunan şifreli dosyalar'),
+                leading: const Icon(Icons.lock_outline_rounded),
+                onTap: () => Navigator.of(context).pushNamed('/vault'),
+              ),
+            ),
+            _tvItem(
+              onActivate: () => _openCloudAdvanced(context),
+              child: ListTile(
+                title: const Text('Bulut bağlantıları'),
+                subtitle: const Text(
+                  'Drive / Dropbox / OneDrive / Box — kendi istemci kimliğinizle '
+                  '(gelişmiş)',
+                ),
+                leading: const Icon(Icons.cloud_rounded),
+                onTap: () => _openCloudAdvanced(context),
+              ),
+            ),
+            _tvItem(
+              onActivate: () => Navigator.of(context).pushNamed('/clean'),
+              child: ListTile(
+                title: const Text('Temizlik merkezi'),
+                subtitle:
+                    const Text('Öneriler, geçici, mükerrer, büyük dosyalar'),
+                leading: const Icon(Icons.cleaning_services_rounded),
+                onTap: () => Navigator.of(context).pushNamed('/clean'),
+              ),
+            ),
+            _tvItem(
+              onActivate: () => Navigator.of(context).pushNamed('/usb'),
+              child: ListTile(
+                title: const Text('USB / SD Kart'),
+                subtitle: const Text('Bağlı harici depolama birimleri'),
+                leading: const Icon(Icons.sd_card_rounded),
+                onTap: () => Navigator.of(context).pushNamed('/usb'),
+              ),
+            ),
+            _tvItem(
+              onActivate: () =>
+                  Navigator.of(context).pushNamed('/duplicates'),
+              child: ListTile(
+                title: const Text('Mükerrer dosyalar'),
+                subtitle: const Text('Aynı içeriğe sahip kopyaları bul'),
+                leading: const Icon(Icons.copy_all_rounded),
+                onTap: () => Navigator.of(context).pushNamed('/duplicates'),
+              ),
+            ),
+            _tvItem(
+              onActivate: () => Navigator.of(context).pushNamed('/privacy'),
+              child: ListTile(
+                title: const Text('Gizlilik ve ilkeler'),
+                subtitle:
+                    const Text('Reklam yok • Veri toplanmaz • Ücretsiz'),
+                leading: const Icon(Icons.privacy_tip_rounded),
+                onTap: () => Navigator.of(context).pushNamed('/privacy'),
+              ),
+            ),
+            const Divider(),
+            _sectionHeader(context, 'Güvenlik'),
+            const _AppLockSettings(),
+            const Divider(),
+            _sectionHeader(context, 'Tarayıcı düzeni'),
+            _tvItem(
+              onActivate: () =>
+                  settings.forceDualPane = !settings.forceDualPane,
+              child: SwitchListTile(
+                title: const Text('Çift bölme (telefon dahil)'),
+                subtitle: const Text(
+                  'Açıkken dar ekranda da klasör ağacı + liste yan yana',
+                ),
+                secondary: const Icon(Icons.view_column_rounded),
+                value: settings.forceDualPane,
+                onChanged: (v) => settings.forceDualPane = v,
+              ),
+            ),
+            _tvItem(
+              onActivate: () => _pickDualPaneWidth(context, settings),
+              child: ListTile(
+                title: const Text('Çift bölme genişlik eşiği'),
+                subtitle: Text('${settings.dualPaneMinWidth} px'),
+                leading: const Icon(Icons.width_wide_rounded),
+                onTap: () => _pickDualPaneWidth(context, settings),
+              ),
+            ),
+            _tvItem(
+              onActivate: () => _pickDropAction(context, settings),
+              child: ListTile(
+                title: const Text('Sürükle-bırak eylemi'),
+                subtitle: Text(switch (settings.dropAction) {
+                  'copy' => 'Her zaman kopyala',
+                  'move' => 'Her zaman taşı',
+                  _ => 'Her seferinde sor',
+                }),
+                leading: const Icon(Icons.drag_indicator_rounded),
+                onTap: () => _pickDropAction(context, settings),
+              ),
+            ),
+            _tvItem(
+              onActivate: () => Navigator.of(context).push(
+                MaterialPageRoute(
+                    builder: (_) => const PermissionsScreen()),
+              ),
+              child: ListTile(
+                title: const Text('İzinler'),
+                subtitle:
+                    const Text('Tüm erişim izinlerini gör ve değiştir'),
+                leading: const Icon(Icons.shield_rounded),
+                onTap: () => Navigator.of(context).push(
+                  MaterialPageRoute(
+                      builder: (_) => const PermissionsScreen()),
+                ),
+              ),
+            ),
+            _tvItem(
+              onActivate: () {
+                settings.deviceModeChosen = false;
+                Navigator.of(context).popUntil((r) => r.isFirst);
+              },
+              child: ListTile(
+                title: const Text('Sürüm seçimini göster'),
+                subtitle: const Text(
+                    'Mobil-Tablet / TV seçim ekranı yeniden açılsın'),
+                leading: const Icon(Icons.restart_alt_rounded),
+                onTap: () {
+                  settings.deviceModeChosen = false;
+                  Navigator.of(context).popUntil((r) => r.isFirst);
+                },
+              ),
+            ),
+            _tvItem(
+              onActivate: () async {
+                final ok = await PlatformService.openDefaultAppsSettings();
+                if (!ok && context.mounted) {
+                  ScaffoldMessenger.of(context).showSnackBar(
+                    const SnackBar(content: Text('Ayarlar açılamadı')),
+                  );
+                }
+              },
+              child: ListTile(
+                title: const Text('Varsayılan uygulamalar'),
+                subtitle:
+                    const Text('Dosya türleri için varsayılan uygulamalar'),
+                leading: const Icon(Icons.open_in_new_rounded),
+                onTap: () async {
+                  final ok =
+                      await PlatformService.openDefaultAppsSettings();
+                  if (!ok && context.mounted) {
+                    ScaffoldMessenger.of(context).showSnackBar(
+                      const SnackBar(content: Text('Ayarlar açılamadı')),
+                    );
+                  }
+                },
+              ),
+            ),
+            _tvItem(
+              onActivate: () =>
+                  Navigator.of(context).pushNamed('/apps/system'),
+              child: ListTile(
+                title: const Text('Dahili uygulamalar'),
+                subtitle: const Text('Cihazla gelen (sistem) uygulamalar'),
+                leading: const Icon(Icons.apps_rounded),
+                onTap: () =>
+                    Navigator.of(context).pushNamed('/apps/system'),
+              ),
+            ),
+            const Divider(),
+            _sectionHeader(context, 'Diğer ayarlar'),
+            _tvItem(
+              onActivate: () => _pickSizeUnit(context, settings),
+              child: ListTile(
+                title: const Text('Dosya boyutu birimi'),
+                subtitle: Text(settings.sizeUnit),
+                leading: const Icon(Icons.data_object_rounded),
+                onTap: () => _pickSizeUnit(context, settings),
+              ),
+            ),
+            _tvItem(
+              onActivate: () => _pickDateFormat(context, settings),
+              child: ListTile(
+                title: const Text('Tarih biçimi'),
+                subtitle: Text(Formats.date(DateTime.now(),
+                    pattern: settings.datePattern)),
+                leading: const Icon(Icons.event_rounded),
+                onTap: () => _pickDateFormat(context, settings),
+              ),
+            ),
+            const Divider(),
+            _sectionHeader(context, 'Geçici dosyalar'),
+            _tvItem(
+              onActivate: () => Navigator.of(context).pushNamed('/temp'),
+              child: ListTile(
+                title: const Text('Geçici dosyalar'),
+                subtitle: const Text('Önbellek ve geçici dosyaları temizle'),
+                leading: const Icon(Icons.cleaning_services_rounded),
+                onTap: () => Navigator.of(context).pushNamed('/temp'),
+              ),
+            ),
+            const Divider(),
+            _sectionHeader(context, 'Geri Dönüşüm Kutusu Ayarları'),
+            _tvItem(
+              onActivate: () =>
+                  settings.recycleBinDefault = !settings.recycleBinDefault,
+              child: SwitchListTile(
+                title: const Text('Varsayılan olarak geri dönüşüm kutusu'),
+                subtitle: const Text(
+                  'Kapalı: F Dosya Yöneticisi gibi kalıcı siler. '
+                  'Açık: silinenleri kutuya taşır',
+                ),
+                value: settings.recycleBinDefault,
+                onChanged: (v) => settings.recycleBinDefault = v,
+              ),
+            ),
+            _tvItem(
+              onActivate: () =>
+                  settings.recycleBinConfirm = !settings.recycleBinConfirm,
+              child: SwitchListTile(
+                title: const Text('Geri Dönüşüm onayını göster'),
+                value: settings.recycleBinConfirm,
+                onChanged: (v) => settings.recycleBinConfirm = v,
+              ),
+            ),
+            const Divider(),
+            _sectionHeader(context, 'Bildirim ayarları'),
+            _tvItem(
+              onActivate: () => _pickWarnPercent(context, settings),
+              child: ListTile(
+                title: const Text('Bellek dolu'),
+                subtitle: Text(
+                    'Depolama alanı %${settings.storageWarnPercent} dolu olduğunda göster'),
+                leading: const Icon(Icons.notifications_active_rounded),
+                onTap: () => _pickWarnPercent(context, settings),
+              ),
+            ),
+            const Divider(),
+            _sectionHeader(context, 'Gelişmiş Ayarlar'),
+            _tvItem(
+              onActivate: () =>
+                  settings.showNavIcon = !settings.showNavIcon,
+              child: SwitchListTile(
+                title: const Text('Nav icon simgesini (≡) her zaman göster'),
+                value: settings.showNavIcon,
+                onChanged: (v) => settings.showNavIcon = v,
+              ),
+            ),
+            _tvItem(
+              onActivate: () => settings.detectUsb = !settings.detectUsb,
+              child: SwitchListTile(
+                title: const Text('USB bağlantısını algıla'),
+                value: settings.detectUsb,
+                onChanged: (v) => settings.detectUsb = v,
+              ),
+            ),
+            _tvItem(
+              onActivate: () =>
+                  settings.showSystemStorage = !settings.showSystemStorage,
+              child: SwitchListTile(
+                title: const Text('Sistem depolamasını göster'),
+                value: settings.showSystemStorage,
+                onChanged: (v) => settings.showSystemStorage = v,
+              ),
+            ),
+            const Divider(),
+            _sectionHeader(context, 'Gelişmiş menüleri göster'),
+            _tvItem(
+              onActivate: () =>
+                  settings.showBookmarkMenu = !settings.showBookmarkMenu,
+              child: SwitchListTile(
+                title: const Text('Yer imine ekle'),
+                subtitle:
+                    const Text('Klasör satır menüsünde yer imi seçeneği'),
+                value: settings.showBookmarkMenu,
+                onChanged: (v) => settings.showBookmarkMenu = v,
+              ),
+            ),
+            _tvItem(
+              onActivate: () => settings.showAddToHomeMenu =
+                  !settings.showAddToHomeMenu,
+              child: SwitchListTile(
+                title: const Text('Ana ekrana ekle'),
+                subtitle: const Text(
+                    'Klasörü cihaz ana ekranına kısayol olarak ekle'),
+                value: settings.showAddToHomeMenu,
+                onChanged: (v) => settings.showAddToHomeMenu = v,
+              ),
+            ),
+            _tvItem(
+              onActivate: () => settings.showHideToggleMenu =
+                  !settings.showHideToggleMenu,
+              child: SwitchListTile(
+                title: const Text('Gizli dosya anahtarı'),
+                subtitle: const Text(
+                    'Tarayıcı menüsünde gizli dosyaları göster/gizle'),
+                value: settings.showHideToggleMenu,
+                onChanged: (v) => settings.showHideToggleMenu = v,
+              ),
+            ),
+            _tvItem(
+              onActivate: () =>
+                  settings.showOpenWithMenu = !settings.showOpenWithMenu,
+              child: SwitchListTile(
+                title: const Text('Farklı aç'),
+                subtitle:
+                    const Text('Dosyayı başka uygulamayla açma seçeneği'),
+                value: settings.showOpenWithMenu,
+                onChanged: (v) => settings.showOpenWithMenu = v,
+              ),
+            ),
+            _tvItem(
+              onActivate: () =>
+                  settings.showHiddenFiles = !settings.showHiddenFiles,
+              child: SwitchListTile(
+                title: const Text('Gizli dosyaları göster'),
+                subtitle:
+                    const Text('Nokta ile başlayan dosya ve klasörler'),
+                value: settings.showHiddenFiles,
+                onChanged: (v) => settings.showHiddenFiles = v,
+              ),
+            ),
+            const SizedBox(height: 24),
+          ],
+        ),
       ),
+    );
+  }
+
+  /// TV'de D-pad ile kaydırılabilir odak; telefonda çocuğu olduğu gibi bırakır.
+  static Widget _tvItem({
+    required Widget child,
+    VoidCallback? onActivate,
+    bool autofocus = false,
+  }) {
+    return TvFocusable(
+      autofocus: autofocus,
+      onActivate: onActivate,
+      child: child,
     );
   }
 
@@ -319,38 +505,21 @@ class SettingsScreen extends StatelessWidget {
         ),
       );
 
-  /// Hakkında başlığı (bilgi simgesi + başlık; Makay ekosistemiyle aynı
-  /// görünüm).
-  static Widget _aboutHeader(BuildContext context) {
-    final theme = Theme.of(context);
-    return Padding(
-      padding: const EdgeInsets.fromLTRB(16, 16, 16, 8),
-      child: Row(
-        children: [
-          Icon(Icons.info_rounded, size: 18, color: theme.colorScheme.primary),
-          const SizedBox(width: 6),
-          Text(
-            'Hakkında',
-            style: theme.textTheme.titleMedium?.copyWith(
-              color: theme.colorScheme.primary,
-              fontWeight: FontWeight.bold,
-            ),
-          ),
-        ],
-      ),
-    );
-  }
+  /// Paket bilgisi süreç ömründe bir kez okunur. `build` içinde her seferinde
+  /// `PackageInfo.fromPlatform()` çağrılırsa her ayar değişiminde platform
+  /// kanalı yeniden sorgulanır ve kart "…"ya döner.
+  static final Future<PackageInfo> _packageInfo = PackageInfo.fromPlatform();
 
-  /// Ekosistem uyumlu Hakkında kartı (Makay Cleaner ile birebir yapı):
-  /// uygulama adı + sürüm, Geliştirici bilgisi ve telif satırı.
+  /// Makay Cleaner ile birebir Hakkında kartı.
   static Widget _aboutCard(BuildContext context, ThemeData theme) => Card(
         shape: RoundedRectangleBorder(
-          borderRadius: BorderRadius.circular(16),
+          borderRadius: BorderRadius.circular(12),
         ),
+        elevation: 2,
         child: Padding(
           padding: const EdgeInsets.all(16),
           child: FutureBuilder<PackageInfo>(
-            future: PackageInfo.fromPlatform(),
+            future: _packageInfo,
             builder: (context, snapshot) => Column(
               crossAxisAlignment: CrossAxisAlignment.start,
               children: [
@@ -359,30 +528,35 @@ class SettingsScreen extends StatelessWidget {
                   style: theme.textTheme.titleMedium
                       ?.copyWith(fontWeight: FontWeight.bold),
                 ),
-                const SizedBox(height: 4),
+                const SizedBox(height: 8),
                 Text(
                   'Sürüm: ${snapshot.hasData ? snapshot.data!.version : '…'}',
-                  style: theme.textTheme.bodyMedium,
+                  style: theme.textTheme.bodyMedium?.copyWith(
+                    color: theme.colorScheme.onSurfaceVariant,
+                  ),
                 ),
-                const SizedBox(height: 14),
-                const Divider(height: 1),
-                const SizedBox(height: 14),
-                Text(
-                  'Geliştirici',
-                  style: theme.textTheme.titleSmall
-                      ?.copyWith(fontWeight: FontWeight.bold),
-                ),
-                const SizedBox(height: 4),
-                const Text(
-                  'Bu uygulamanın tasarımı ve geliştirmesi Murat AKAY '
-                  'tarafından yapılmıştır.',
-                ),
-                const SizedBox(height: 14),
+                const SizedBox(height: 12),
                 const Divider(height: 1),
                 const SizedBox(height: 12),
                 Text(
-                  '© ${DateTime.now().year} Tüm hakları saklıdır. Sideload '
-                  '/ yerel dağıtım için hazırlanmıştır.',
+                  'Geliştirici',
+                  style: theme.textTheme.titleSmall
+                      ?.copyWith(fontWeight: FontWeight.w600),
+                ),
+                const SizedBox(height: 4),
+                Text(
+                  'Bu uygulamanın tasarımı ve geliştirmesi Murat AKAY '
+                  'tarafından yapılmıştır.',
+                  style: theme.textTheme.bodyMedium?.copyWith(
+                    color: theme.colorScheme.onSurfaceVariant,
+                  ),
+                ),
+                const SizedBox(height: 12),
+                const Divider(height: 1),
+                const SizedBox(height: 12),
+                Text(
+                  '© 2026 Tüm hakları saklıdır. Sideload / yerel dağıtım için '
+                  'hazırlanmıştır.',
                   style: theme.textTheme.bodySmall?.copyWith(
                     color: theme.colorScheme.onSurfaceVariant,
                   ),
@@ -393,22 +567,6 @@ class SettingsScreen extends StatelessWidget {
         ),
       );
 
-  /// Elle güncelleme denetimi (A15): depoda yeni sürüm varsa diyaloğu açar.
-  static Future<void> _checkUpdate(BuildContext context) async {
-    ScaffoldMessenger.of(context).showSnackBar(
-      const SnackBar(content: Text('Güncelleme kontrol ediliyor…')),
-    );
-    final info = await UpdateService.check();
-    if (!context.mounted) return;
-    ScaffoldMessenger.of(context).hideCurrentSnackBar();
-    if (info == null) {
-      ScaffoldMessenger.of(context).showSnackBar(
-        const SnackBar(content: Text('Yeni sürüm bulunamadı')),
-      );
-    } else {
-      await showUpdateDialog(context, info);
-    }
-  }
 
   /// Görünüm (görsel preset) seçimi: yazı, ikon, köşe ve arka plan birlikte.
   static Future<void> _pickAppearance(
@@ -517,6 +675,34 @@ class SettingsScreen extends StatelessWidget {
       ),
     );
     if (mode != null) settings.tvMode = mode;
+  }
+
+  /// Arayüz dili: cihaz dili / Türkçe / İngilizce.
+  static Future<void> _pickLocale(
+      BuildContext context, SettingsProvider settings) async {
+    final value = await showDialog<String>(
+      context: context,
+      builder: (context) => SimpleDialog(
+        title: const Text('Uygulama dili'),
+        children: [
+          RadioGroup<String>(
+            groupValue: settings.localeCode ?? 'system',
+            onChanged: (v) {
+              if (v != null) Navigator.of(context).pop(v);
+            },
+            child: const Column(
+              children: [
+                RadioListTile<String>(
+                    title: Text('Cihaz dili (otomatik)'), value: 'system'),
+                RadioListTile<String>(title: Text('Türkçe'), value: 'tr'),
+                RadioListTile<String>(title: Text('English'), value: 'en'),
+              ],
+            ),
+          ),
+        ],
+      ),
+    );
+    if (value != null) settings.localeCode = value;
   }
 
   /// Görünüm düzeni seçimi: dikey/yatay sütun sayısı.
@@ -697,6 +883,139 @@ class SettingsScreen extends StatelessWidget {
   }
 }
 
+/// Makay Cleaner’daki “🔄 Güncelleme kontrol et” satırı.
+class _UpdateCheckTile extends StatefulWidget {
+  const _UpdateCheckTile({this.autofocus = false});
+
+  final bool autofocus;
+
+  @override
+  State<_UpdateCheckTile> createState() => _UpdateCheckTileState();
+}
+
+class _UpdateCheckTileState extends State<_UpdateCheckTile> {
+  bool _checking = false;
+  String? _status;
+  bool _isError = false;
+  final _statusKey = GlobalKey();
+
+  Future<void> _run() async {
+    if (_checking) return;
+    setState(() {
+      _checking = true;
+      _status = 'Güncelleme kontrol ediliyor…';
+      _isError = false;
+    });
+    _revealStatus();
+    try {
+      final info = await UpdateService.check();
+      if (!mounted) return;
+      if (info == null) {
+        setState(() {
+          _checking = false;
+          _status = 'Uygulama güncel';
+          _isError = false;
+        });
+        _revealStatus(snack: 'Uygulama güncel');
+      } else {
+        setState(() {
+          _checking = false;
+          _status = 'Yeni sürüm: ${info.version}';
+          _isError = false;
+        });
+        _revealStatus(snack: 'Yeni sürüm: ${info.version}');
+        await showUpdateDialog(context, info);
+      }
+    } catch (e) {
+      if (!mounted) return;
+      // Makay Cleaner: "Kontrol başarısız: $err"
+      var detail = e.toString();
+      if (detail.startsWith('StateError: ')) {
+        detail = detail.substring('StateError: '.length);
+      }
+      if (detail.startsWith('Exception: ')) {
+        detail = detail.substring('Exception: '.length);
+      }
+      if (detail.length > 280) detail = '${detail.substring(0, 280)}…';
+      setState(() {
+        _checking = false;
+        _status = 'Kontrol başarısız: $detail';
+        _isError = true;
+      });
+      _revealStatus(snack: 'Kontrol başarısız: $detail', error: true);
+    }
+  }
+
+  /// TV overscan / kaydırma: durum satırını görünür yap; TV'de SnackBar da göster.
+  void _revealStatus({String? snack, bool error = false}) {
+    WidgetsBinding.instance.addPostFrameCallback((_) {
+      if (!mounted) return;
+      final ctx = _statusKey.currentContext;
+      if (ctx != null && ctx.mounted) {
+        Scrollable.ensureVisible(
+          ctx,
+          alignment: 0.4,
+          duration: const Duration(milliseconds: 180),
+          curve: Curves.easeOut,
+        );
+      }
+      if (snack == null || !TvUi.enabled(context)) return;
+      final messenger = ScaffoldMessenger.of(context);
+      messenger.hideCurrentSnackBar();
+      messenger.showSnackBar(
+        SnackBar(
+          content: Text(snack),
+          backgroundColor: error ? Theme.of(context).colorScheme.error : null,
+          duration: const Duration(seconds: 4),
+          behavior: SnackBarBehavior.floating,
+        ),
+      );
+    });
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    final theme = Theme.of(context);
+    return TvFocusable(
+      autofocus: widget.autofocus,
+      onActivate: _checking ? null : _run,
+      child: Padding(
+        padding: const EdgeInsets.symmetric(horizontal: 16),
+        child: Column(
+          crossAxisAlignment: CrossAxisAlignment.stretch,
+          children: [
+            FilledButton(
+              onPressed: _checking ? null : _run,
+              style: FilledButton.styleFrom(
+                backgroundColor: const Color(0xFF1565C0),
+                minimumSize: const Size.fromHeight(52),
+              ),
+              child: Text(
+                _checking ? 'Kontrol ediliyor…' : '🔄 Güncelleme kontrol et',
+              ),
+            ),
+            if (_status != null) ...[
+              const SizedBox(height: 8),
+              KeyedSubtree(
+                key: _statusKey,
+                child: Text(
+                  _status!,
+                  style: theme.textTheme.bodyMedium?.copyWith(
+                    color: _isError
+                        ? theme.colorScheme.error
+                        : theme.colorScheme.onSurfaceVariant,
+                    fontWeight: FontWeight.w600,
+                  ),
+                ),
+              ),
+            ],
+          ],
+        ),
+      ),
+    );
+  }
+}
+
 /// Uygulama kilidi + biyometri ayarları (stateful — Async tercihler).
 class _AppLockSettings extends StatefulWidget {
   const _AppLockSettings();
@@ -739,9 +1058,26 @@ class _AppLockSettingsState extends State<_AppLockSettings> {
     });
   }
 
+  /// PIN soran diyalog. Oluşturulan controller'lar diyalog kapandığında
+  /// dispose edilir (aksi halde her çağrı 2 ChangeNotifier sızdırır).
   Future<String?> _askPin({required String title, String? confirmLabel}) async {
     final c1 = TextEditingController();
     final c2 = TextEditingController();
+    try {
+      return await _showPinDialog(title: title, confirmLabel: confirmLabel,
+          c1: c1, c2: c2);
+    } finally {
+      c1.dispose();
+      c2.dispose();
+    }
+  }
+
+  Future<String?> _showPinDialog({
+    required String title,
+    required String? confirmLabel,
+    required TextEditingController c1,
+    required TextEditingController c2,
+  }) {
     return showDialog<String>(
       context: context,
       builder: (context) => AlertDialog(

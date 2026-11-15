@@ -187,4 +187,5 @@ flutter run -d android
 flutter build apk --release
 
 # Tamamlanmış sürüm (sürüm artışı + sha256 + otomatik GitHub Release): Apk Hazırla.bat
+# GitHub oturumu yoksa önce bir kez: Gh-Giris.bat
 ```

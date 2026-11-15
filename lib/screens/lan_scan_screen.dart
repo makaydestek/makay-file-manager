@@ -2,6 +2,7 @@ import 'package:flutter/material.dart';
 
 import '../services/lan_scan_service.dart';
 import '../services/remote_service.dart';
+import '../widgets/tv_focusable.dart';
 import 'remote_screen.dart' show RemoteFormDialog;
 
 /// Yerel ağ taraması: alt ağı tarar, SMB/FTP/SFTP/WebDAV sunucularını
@@ -73,35 +74,53 @@ class _LanScanScreenState extends State<LanScanScreen> {
             ),
             const Divider(height: 1),
             if (device.hasSmb)
-              ListTile(
-                leading: const Icon(Icons.folder_shared_rounded,
-                    color: Color(0xFF00897B)),
-                title: const Text('SMB paylaşımına bağlan'),
-                subtitle: const Text('Windows / Samba paylaşımı (port 445)'),
-                onTap: () => _add(device, 'smb'),
+              TvFocusable(
+                autofocus: true,
+                onActivate: () => _add(device, 'smb'),
+                child: ListTile(
+                  leading: const Icon(Icons.folder_shared_rounded,
+                      color: Color(0xFF00897B)),
+                  title: const Text('SMB paylaşımına bağlan'),
+                  subtitle:
+                      const Text('Windows / Samba paylaşımı (port 445)'),
+                  onTap: () => _add(device, 'smb'),
+                ),
               ),
             if (device.hasFtp)
-              ListTile(
-                leading:
-                    const Icon(Icons.dns_rounded, color: Color(0xFF00897B)),
-                title: const Text('FTP sunucusuna bağlan'),
-                onTap: () => _add(device, 'ftp'),
+              TvFocusable(
+                autofocus: !device.hasSmb,
+                onActivate: () => _add(device, 'ftp'),
+                child: ListTile(
+                  leading: const Icon(Icons.dns_rounded,
+                      color: Color(0xFF00897B)),
+                  title: const Text('FTP sunucusuna bağlan'),
+                  onTap: () => _add(device, 'ftp'),
+                ),
               ),
             if (device.hasSftp)
-              ListTile(
-                leading:
-                    const Icon(Icons.lock_rounded, color: Color(0xFF00897B)),
-                title: const Text('SFTP sunucusuna bağlan'),
-                subtitle: const Text('SSH tabanlı (port 22)'),
-                onTap: () => _add(device, 'sftp'),
+              TvFocusable(
+                autofocus: !device.hasSmb && !device.hasFtp,
+                onActivate: () => _add(device, 'sftp'),
+                child: ListTile(
+                  leading: const Icon(Icons.lock_rounded,
+                      color: Color(0xFF00897B)),
+                  title: const Text('SFTP sunucusuna bağlan'),
+                  subtitle: const Text('SSH tabanlı (port 22)'),
+                  onTap: () => _add(device, 'sftp'),
+                ),
               ),
             if (device.hasWebDav)
-              ListTile(
-                leading:
-                    const Icon(Icons.cloud_rounded, color: Color(0xFF00897B)),
-                title: const Text('WebDAV adresi ekle'),
-                subtitle: Text('http://${device.ip} adresiyle başlar'),
-                onTap: () => _add(device, 'webdav'),
+              TvFocusable(
+                autofocus:
+                    !device.hasSmb && !device.hasFtp && !device.hasSftp,
+                onActivate: () => _add(device, 'webdav'),
+                child: ListTile(
+                  leading: const Icon(Icons.cloud_rounded,
+                      color: Color(0xFF00897B)),
+                  title: const Text('WebDAV adresi ekle'),
+                  subtitle: Text('http://${device.ip} adresiyle başlar'),
+                  onTap: () => _add(device, 'webdav'),
+                ),
               ),
             const SizedBox(height: 8),
           ],
@@ -231,42 +250,47 @@ class _LanScanScreenState extends State<LanScanScreen> {
                             ),
                           ),
                         ),
-                      for (final d in _devices)
-                        ListTile(
-                          leading: const Icon(Icons.computer_rounded,
-                              color: Color(0xFF00897B)),
-                          title: Text(d.ip),
-                          subtitle: Text(d.summary),
-                          trailing: Wrap(
-                            spacing: 4,
-                            children: [
-                              if (d.hasSmb)
-                                const Chip(
-                                  label: Text('SMB'),
-                                  visualDensity: VisualDensity.compact,
-                                  padding: EdgeInsets.zero,
-                                ),
-                              if (d.hasFtp)
-                                const Chip(
-                                  label: Text('FTP'),
-                                  visualDensity: VisualDensity.compact,
-                                  padding: EdgeInsets.zero,
-                                ),
-                              if (d.hasSftp)
-                                const Chip(
-                                  label: Text('SFTP'),
-                                  visualDensity: VisualDensity.compact,
-                                  padding: EdgeInsets.zero,
-                                ),
-                              if (d.hasWebDav)
-                                const Chip(
-                                  label: Text('DAV'),
-                                  visualDensity: VisualDensity.compact,
-                                  padding: EdgeInsets.zero,
-                                ),
-                            ],
+                      for (var i = 0; i < _devices.length; i++)
+                        TvFocusable(
+                          autofocus: i == 0,
+                          onActivate: () => _deviceOptions(_devices[i]),
+                          scale: 1.02,
+                          child: ListTile(
+                            leading: const Icon(Icons.computer_rounded,
+                                color: Color(0xFF00897B)),
+                            title: Text(_devices[i].ip),
+                            subtitle: Text(_devices[i].summary),
+                            trailing: Wrap(
+                              spacing: 4,
+                              children: [
+                                if (_devices[i].hasSmb)
+                                  const Chip(
+                                    label: Text('SMB'),
+                                    visualDensity: VisualDensity.compact,
+                                    padding: EdgeInsets.zero,
+                                  ),
+                                if (_devices[i].hasFtp)
+                                  const Chip(
+                                    label: Text('FTP'),
+                                    visualDensity: VisualDensity.compact,
+                                    padding: EdgeInsets.zero,
+                                  ),
+                                if (_devices[i].hasSftp)
+                                  const Chip(
+                                    label: Text('SFTP'),
+                                    visualDensity: VisualDensity.compact,
+                                    padding: EdgeInsets.zero,
+                                  ),
+                                if (_devices[i].hasWebDav)
+                                  const Chip(
+                                    label: Text('DAV'),
+                                    visualDensity: VisualDensity.compact,
+                                    padding: EdgeInsets.zero,
+                                  ),
+                              ],
+                            ),
+                            onTap: () => _deviceOptions(_devices[i]),
                           ),
-                          onTap: () => _deviceOptions(d),
                         ),
                     ],
                   ),

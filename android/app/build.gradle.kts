@@ -53,11 +53,29 @@ android {
 
     buildTypes {
         release {
-            // Release anahtarı varsa onunla, yoksa (ilk kurulum) debug ile imzala.
-            signingConfig = if (keystorePropertiesFile.exists()) {
-                signingConfigs.getByName("release")
+            // Release anahtarı varsa onunla imzala. Anahtar yoksa debug ile
+            // imzalamak SESSİZCE yanlış imzalı APK üretir (kurulu kullanıcılar
+            // güncelleme alamaz). Bunun yerine derleme açıkça durdurulur.
+            // Yerel geliştirme için `-PreleaseDebugSign=true` geçilebilir.
+            val allowDebugSign =
+                (project.findProperty("releaseDebugSign") as String?)
+                    ?.toBoolean() == true
+            if (keystorePropertiesFile.exists()) {
+                signingConfig = signingConfigs.getByName("release")
+            } else if (allowDebugSign) {
+                logger.warn(
+                    "[KESTORE] Release anahtarı yok; -PreleaseDebugSign=true " +
+                        "ile DEBUG imzası kullanılıyor. Bu APK yayınlanmamalıdır."
+                )
+                signingConfig = signingConfigs.getByName("debug")
             } else {
-                signingConfigs.getByName("debug")
+                throw GradleException(
+                    "android/key.properties bulunamadı: release derlemesi " +
+                        "imzalanamaz.\n  Yayın için keystore yapılandırın " +
+                        "(bkz. docs/KEYSTORE YEDEKLEME.md)\n  Yerel test " +
+                        "derlemesi için: flutter build apk --release " +
+                        "-PreleaseDebugSign=true"
+                )
             }
             // RAR/7Z bağımlılıklarının R8 "missing class" hatasını önlemek için.
             proguardFiles(

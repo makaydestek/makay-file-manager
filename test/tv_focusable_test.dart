@@ -69,4 +69,57 @@ void main() {
     await tester.pump();
     expect(activated, 2);
   });
+
+  testWidgets('TV formunda yön tuşları alanlar arası geçer', (tester) async {
+    final settings = await loadSettings(tvMode: 'tv');
+    final a = FocusNode(debugLabel: 'a');
+    final b = FocusNode(debugLabel: 'b');
+    addTearDown(a.dispose);
+    addTearDown(b.dispose);
+
+    await tester.pumpWidget(
+      ChangeNotifierProvider.value(
+        value: settings,
+        child: MaterialApp(
+          home: Scaffold(
+            body: Column(
+              children: [
+                TvTextFormField(
+                  focusNode: a,
+                  autofocus: true,
+                  decoration: const InputDecoration(labelText: 'Alan A'),
+                ),
+                TvTextFormField(
+                  focusNode: b,
+                  decoration: const InputDecoration(labelText: 'Alan B'),
+                ),
+              ],
+            ),
+          ),
+        ),
+      ),
+    );
+    await tester.pumpAndSettle();
+    // TvTextFormField yön yakalayıcısını post-frame bağlar.
+    await tester.pump();
+    expect(a.hasFocus, isTrue);
+    expect(a.onKeyEvent, isNotNull,
+        reason: 'TV yön tuşu yakalayıcısı FocusNode\'a bağlanmalı');
+
+    await tester.sendKeyEvent(LogicalKeyboardKey.arrowDown);
+    await tester.pumpAndSettle();
+    expect(b.hasFocus, isTrue, reason: 'aşağı sonraki alana geçmeli');
+
+    await tester.sendKeyEvent(LogicalKeyboardKey.arrowUp);
+    await tester.pumpAndSettle();
+    expect(a.hasFocus, isTrue, reason: 'yukarı önceki alana dönmeli');
+
+    await tester.sendKeyEvent(LogicalKeyboardKey.arrowRight);
+    await tester.pumpAndSettle();
+    expect(b.hasFocus, isTrue, reason: 'ileri (sağ) sonraki alana geçmeli');
+
+    await tester.sendKeyEvent(LogicalKeyboardKey.arrowLeft);
+    await tester.pumpAndSettle();
+    expect(a.hasFocus, isTrue, reason: 'geri (sol) önceki alana dönmeli');
+  });
 }

@@ -164,20 +164,28 @@ class _RemoteScreenState extends State<RemoteScreen> {
       context: context,
       builder: (context) => AlertDialog(
         title: const Text('Yeniden adlandır'),
-        content: TextField(
+        content: TvTextFormField(
           controller: controller,
           autofocus: true,
           decoration: const InputDecoration(labelText: 'Bağlantı adı'),
-          onSubmitted: (v) => Navigator.pop(context, v.trim()),
+          onFieldSubmitted: (v) => Navigator.pop(context, v.trim()),
         ),
         actions: [
-          TextButton(
-            onPressed: () => Navigator.pop(context),
-            child: const Text('Vazgeç'),
+          TvFocusable(
+            onActivate: () => Navigator.pop(context),
+            child: TextButton(
+              onPressed: () => Navigator.pop(context),
+              child: const Text('Vazgeç'),
+            ),
           ),
-          FilledButton(
-            onPressed: () => Navigator.pop(context, controller.text.trim()),
-            child: const Text('Kaydet'),
+          TvFocusable(
+            onActivate: () =>
+                Navigator.pop(context, controller.text.trim()),
+            child: FilledButton(
+              onPressed: () =>
+                  Navigator.pop(context, controller.text.trim()),
+              child: const Text('Kaydet'),
+            ),
           ),
         ],
       ),
@@ -336,10 +344,13 @@ class _RemoteScreenState extends State<RemoteScreen> {
     return Scaffold(
       drawer: const AppDrawer(),
       appBar: AppBar(title: const Text('Uzak')),
-      floatingActionButton: FloatingActionButton.extended(
-        onPressed: _add,
-        icon: const Icon(Icons.add_rounded),
-        label: const Text('Uzak konum ekle'),
+      floatingActionButton: TvFocusable(
+        onActivate: _add,
+        child: FloatingActionButton.extended(
+          onPressed: _add,
+          icon: const Icon(Icons.add_rounded),
+          label: const Text('Uzak konum ekle'),
+        ),
       ),
       body: _loading
           ? const Center(child: CircularProgressIndicator())
@@ -362,10 +373,14 @@ class _RemoteScreenState extends State<RemoteScreen> {
                           textAlign: TextAlign.center,
                         ),
                         const SizedBox(height: 16),
-                        FilledButton.icon(
-                          onPressed: _add,
-                          icon: const Icon(Icons.add_rounded),
-                          label: const Text('Uzak bir konum ekle'),
+                        TvFocusable(
+                          autofocus: true,
+                          onActivate: _add,
+                          child: FilledButton.icon(
+                            onPressed: _add,
+                            icon: const Icon(Icons.add_rounded),
+                            label: const Text('Uzak bir konum ekle'),
+                          ),
                         ),
                       ],
                     ),
@@ -427,6 +442,7 @@ class _TypePickerDialog extends StatelessWidget {
           title: 'Yerel Ağ',
           subtitle: 'Ağdaki SMB/FTP/SFTP sunucularını tara',
           type: 'lan',
+          autofocus: true,
         ),
         _tile(
           context,
@@ -466,14 +482,23 @@ class _TypePickerDialog extends StatelessWidget {
     required String title,
     required String subtitle,
     required String type,
+    bool autofocus = false,
   }) {
-    return SimpleDialogOption(
-      onPressed: () => Navigator.pop(context, type),
-      child: ListTile(
-        contentPadding: EdgeInsets.zero,
-        leading: Icon(icon, color: const Color(0xFF00897B)),
-        title: Text(title),
-        subtitle: Text(subtitle, style: const TextStyle(fontSize: 12)),
+    void select() => Navigator.pop(context, type);
+    final tile = ListTile(
+      contentPadding: EdgeInsets.zero,
+      leading: Icon(icon, color: const Color(0xFF00897B)),
+      title: Text(title),
+      subtitle: Text(subtitle, style: const TextStyle(fontSize: 12)),
+    );
+    // TV: Dosya Yöneticisi satırları gibi tek odak + OK ile seçim.
+    return TvFocusable(
+      autofocus: autofocus,
+      onActivate: select,
+      scale: 1.02,
+      child: SimpleDialogOption(
+        onPressed: select,
+        child: tile,
       ),
     );
   }
@@ -627,105 +652,126 @@ class _RemoteFormDialogState extends State<RemoteFormDialog> {
           ? '${_type.toUpperCase()} konumunu düzenle'
           : '${_type.toUpperCase()} konumu ekle'),
       content: SingleChildScrollView(
-        child: Form(
-          key: _formKey,
-          child: Column(
-            mainAxisSize: MainAxisSize.min,
-            children: [
-              TextFormField(
-                controller: _name,
-                decoration: const InputDecoration(labelText: 'Bağlantı adı'),
-                autofocus: widget.editing,
-              ),
-              const SizedBox(height: 12),
-              TextFormField(
-                controller: _host,
-                decoration: InputDecoration(
-                  labelText: isWebDav ? 'Adres (URL)' : 'Sunucu (host / IP)',
-                  hintText: isWebDav
-                      ? 'https://sunucu/remote.php/dav/files/kullanici'
-                      : '192.168.1.10 veya smb://192.168.1.10',
-                  helperText: isWebDav
-                      ? 'Şema yoksa https:// eklenir (Nextcloud/ownCloud)'
-                      : 'ftp:// veya smb:// ile yapıştırabilirsiniz',
+        child: FocusTraversalGroup(
+          policy: ReadingOrderTraversalPolicy(),
+          child: Form(
+            key: _formKey,
+            child: Column(
+              mainAxisSize: MainAxisSize.min,
+              children: [
+                TvTextFormField(
+                  controller: _name,
+                  decoration:
+                      const InputDecoration(labelText: 'Bağlantı adı'),
+                  autofocus: true,
+                  textInputAction: TextInputAction.next,
                 ),
-                validator: (v) => (v == null || v.trim().isEmpty)
-                    ? 'Sunucu adresi gerekli'
-                    : null,
-              ),
-              if (!isWebDav) ...[
                 const SizedBox(height: 12),
-                TextFormField(
-                  controller: _port,
+                TvTextFormField(
+                  controller: _host,
                   decoration: InputDecoration(
-                    labelText: 'Port',
-                    helperText: switch (_type) {
-                      'sftp' => 'Varsayılan 22',
-                      'smb' => 'Varsayılan 445',
-                      _ => 'Varsayılan 21',
-                    },
-                  ),
-                  keyboardType: TextInputType.number,
-                ),
-              ],
-              if (isSmb) ...[
-                const SizedBox(height: 12),
-                TextFormField(
-                  controller: _share,
-                  decoration: const InputDecoration(
-                    labelText: 'Paylaşım adı',
-                    hintText: 'örn. Paylasim, home veya C\$',
+                    labelText:
+                        isWebDav ? 'Adres (URL)' : 'Sunucu (host / IP)',
+                    hintText: isWebDav
+                        ? 'https://sunucu/remote.php/dav/files/kullanici'
+                        : '192.168.1.10 veya smb://192.168.1.10',
+                    helperText: isWebDav
+                        ? 'Şema yoksa https:// eklenir (Nextcloud/ownCloud)'
+                        : 'ftp:// veya smb:// ile yapıştırabilirsiniz',
                   ),
                   validator: (v) => (v == null || v.trim().isEmpty)
-                      ? 'Paylaşım adı gerekli (örn. C\$)'
+                      ? 'Sunucu adresi gerekli'
                       : null,
+                  textInputAction: TextInputAction.next,
                 ),
-              ],
-              if (!isSmb && !isWebDav) ...[
-                const SizedBox(height: 12),
-                TextFormField(
-                  controller: _startPath,
-                  decoration: const InputDecoration(
-                    labelText: 'Başlangıç yolu',
-                    hintText: '/',
+                if (!isWebDav) ...[
+                  const SizedBox(height: 12),
+                  TvTextFormField(
+                    controller: _port,
+                    decoration: InputDecoration(
+                      labelText: 'Port',
+                      helperText: switch (_type) {
+                        'sftp' => 'Varsayılan 22',
+                        'smb' => 'Varsayılan 445',
+                        _ => 'Varsayılan 21',
+                      },
+                    ),
+                    keyboardType: TextInputType.number,
+                    textInputAction: TextInputAction.next,
                   ),
+                ],
+                if (isSmb) ...[
+                  const SizedBox(height: 12),
+                  TvTextFormField(
+                    controller: _share,
+                    decoration: const InputDecoration(
+                      labelText: 'Paylaşım adı',
+                      hintText: 'örn. Paylasim, home veya C\$',
+                    ),
+                    validator: (v) => (v == null || v.trim().isEmpty)
+                        ? 'Paylaşım adı gerekli (örn. C\$)'
+                        : null,
+                    textInputAction: TextInputAction.next,
+                  ),
+                ],
+                if (!isSmb && !isWebDav) ...[
+                  const SizedBox(height: 12),
+                  TvTextFormField(
+                    controller: _startPath,
+                    decoration: const InputDecoration(
+                      labelText: 'Başlangıç yolu',
+                      hintText: '/',
+                    ),
+                    textInputAction: TextInputAction.next,
+                  ),
+                ],
+                const SizedBox(height: 12),
+                TvTextFormField(
+                  controller: _username,
+                  decoration: InputDecoration(
+                    labelText: 'Kullanıcı adı',
+                    hintText: _type == 'ftp' ? 'anonymous' : null,
+                  ),
+                  textInputAction: TextInputAction.next,
+                ),
+                const SizedBox(height: 12),
+                TvTextFormField(
+                  controller: _password,
+                  decoration: const InputDecoration(labelText: 'Şifre'),
+                  obscureText: true,
+                  textInputAction: TextInputAction.done,
                 ),
               ],
-              const SizedBox(height: 12),
-              TextFormField(
-                controller: _username,
-                decoration: InputDecoration(
-                  labelText: 'Kullanıcı adı',
-                  hintText: _type == 'ftp' ? 'anonymous' : null,
-                ),
-              ),
-              const SizedBox(height: 12),
-              TextFormField(
-                controller: _password,
-                decoration: const InputDecoration(labelText: 'Şifre'),
-                obscureText: true,
-              ),
-            ],
+            ),
           ),
         ),
       ),
       actions: [
-        TextButton(
-          onPressed: _testing ? null : _test,
-          child: _testing
-              ? const SizedBox(
-                  width: 16,
-                  height: 16,
-                  child: CircularProgressIndicator(strokeWidth: 2))
-              : const Text('Test et'),
+        TvFocusable(
+          onActivate: _testing ? null : _test,
+          child: TextButton(
+            onPressed: _testing ? null : _test,
+            child: _testing
+                ? const SizedBox(
+                    width: 16,
+                    height: 16,
+                    child: CircularProgressIndicator(strokeWidth: 2))
+                : const Text('Test et'),
+          ),
         ),
-        TextButton(
-          onPressed: () => Navigator.pop(context),
-          child: const Text('Vazgeç'),
+        TvFocusable(
+          onActivate: () => Navigator.pop(context),
+          child: TextButton(
+            onPressed: () => Navigator.pop(context),
+            child: const Text('Vazgeç'),
+          ),
         ),
-        FilledButton(
-          onPressed: _testing ? null : _save,
-          child: Text(widget.editing ? 'Güncelle' : 'Kaydet'),
+        TvFocusable(
+          onActivate: _testing ? null : _save,
+          child: FilledButton(
+            onPressed: _testing ? null : _save,
+            child: Text(widget.editing ? 'Güncelle' : 'Kaydet'),
+          ),
         ),
       ],
     );

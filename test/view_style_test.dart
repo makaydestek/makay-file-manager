@@ -13,8 +13,10 @@ import 'package:makay_file_manager/theme/app_theme.dart';
 void main() {
   TestWidgetsFlutterBinding.ensureInitialized();
 
+  /// Ana ekran ızgarası `GridView` değil, `CustomScrollView` içindeki
+  /// `SliverGrid`'dir; sütun sayısı oradan okunur.
   int columns(WidgetTester tester) {
-    final grid = tester.widget<GridView>(find.byType(GridView));
+    final grid = tester.widget<SliverGrid>(find.byType(SliverGrid));
     final delegate =
         grid.gridDelegate as SliverGridDelegateWithFixedCrossAxisCount;
     return delegate.crossAxisCount;

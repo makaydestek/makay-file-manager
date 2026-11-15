@@ -7,7 +7,9 @@ import 'package:path_provider/path_provider.dart';
 import 'package:pointycastle/export.dart';
 import 'package:shared_preferences/shared_preferences.dart';
 
+import '../utils/debug_log.dart';
 import 'category_size_service.dart';
+import 'secure_store.dart';
 
 /// Kasadaki bir şifreli dosyanın açılır kaydı.
 class VaultEntry {
@@ -184,8 +186,7 @@ class VaultService {
 
   static Future<({Uint8List salt, Uint8List verifier, int kdfIterations})?>
       _readMeta() async {
-    final prefs = await SharedPreferences.getInstance();
-    final raw = prefs.getString(_prefsKey);
+    final raw = await _readMetaRaw();
     if (raw == null) return null;
     try {
       final map = jsonDecode(raw) as Map<String, dynamic>;
@@ -201,18 +202,52 @@ class VaultService {
     }
   }
 
+  /// Kasa meta verisi (tuz + doğrulayıcı) — **şifreli** depoda.
+  ///
+  /// SharedPreferences kullanılırsa `android:allowBackup` varsayılanıyla
+  /// Google yedeğine kopyalanır ve saldırgan cihaza dokunmadan offline
+  /// kaba kuvvet çalıştırabilir. Şifreli depo erişilemezse prefs'e düşülür
+  /// (yeni cihazda kasa kaybolmasın) ve bu durum günlüğe yazılır.
+  static const String _secureMetaKey = 'vault.meta.v2';
+
   static Future<void> _writeMeta(
       Uint8List salt, Uint8List verifier, int iterations) async {
+    final payload = jsonEncode({
+      'v': _formatVersion,
+      'salt': _toHex(salt),
+      'verifier': _toHex(verifier),
+      'kdfIterations': iterations,
+    });
+    try {
+      await SecureStore.write(_secureMetaKey, payload);
+      return;
+    } catch (e) {
+      logSwallowed('kasa: meta şifreli depoya yazılamadı', e);
+    }
     final prefs = await SharedPreferences.getInstance();
-    await prefs.setString(
-      _prefsKey,
-      jsonEncode({
-        'v': _formatVersion,
-        'salt': _toHex(salt),
-        'verifier': _toHex(verifier),
-        'kdfIterations': iterations,
-      }),
-    );
+    await prefs.setString(_prefsKey, payload);
+  }
+
+  static Future<String?> _readMetaRaw() async {
+    try {
+      final secure = await SecureStore.read(_secureMetaKey);
+      if (secure != null && secure.isNotEmpty) return secure;
+    } catch (e) {
+      logSwallowed('kasa: meta şifreli depodan okunamadı', e);
+    }
+    final prefs = await SharedPreferences.getInstance();
+    final legacy = prefs.getString(_prefsKey);
+    if (legacy != null && legacy.isNotEmpty) {
+      // Eski (prefs) kayıt bulundu: şifreli depoya taşı ve düz kopyayı sil.
+      var moved = false;
+      try {
+        await SecureStore.write(_secureMetaKey, legacy);
+        moved = true;
+      } catch (_) {}
+      if (moved) await prefs.remove(_prefsKey);
+      return legacy;
+    }
+    return null;
   }
 
   /// PIN ayarlanmış mı.
@@ -282,12 +317,19 @@ class VaultService {
     if (!isValidPin(newPin)) {
       throw ArgumentError('PIN $pinMinLength-$pinMaxLength hane olmalı');
     }
+    // Kilitlenme unlock() ile aynı şekilde uygulanır; aksi halde hatalı eski
+    // PIN `changePin` üzerinden sınırsız denenebilirdi (kaba kuvvet bypass'ı).
+    if (await lockoutRemaining() > Duration.zero) {
+      throw StateError('Çok fazla hatalı deneme. Lütfen bekleyin.');
+    }
     final meta = await _readMeta();
     if (meta == null) throw StateError('Kasa oluşturulmamış');
     final oldKey = await _deriveKeyAsync(oldPin, meta.salt, meta.kdfIterations);
     if (!_checkVerifier(oldKey, meta.verifier)) {
+      await _registerFailure();
       throw ArgumentError('Eski PIN hatalı');
     }
+    await _clearLockout();
 
     final dir = await _ensureDir();
 
@@ -410,12 +452,17 @@ class VaultService {
 
   /// Kasayı ve PIN'i tamamen siler.
   static Future<void> reset() async {
+    // Meta veri şifreli depoda da olabilir; iki yerden de silinir.
+    try {
+      await SecureStore.delete(_secureMetaKey);
+    } catch (_) {}
     final prefs = await SharedPreferences.getInstance();
     await prefs.remove(_prefsKey);
     await prefs.remove(_lockoutKey);
     final dir = await _vaultDir();
     if (await dir.exists()) await dir.delete(recursive: true);
     _key = null;
+    _sessionPin = null; // kilit sonrası süreç belleğinde PIN kalmamalı
   }
 
   // -------------------------------------------------------- kilitlenme --

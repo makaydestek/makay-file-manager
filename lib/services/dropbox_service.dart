@@ -103,7 +103,9 @@ class DropboxService {
     final items = <CloudItem>[];
     var cursor = '';
     var first = true;
-    while (true) {
+    // Sonsuz döngü koruması: bozuk/kötü niyetli yanıt `has_more` için
+    // sürekli true döndürürse liste sayfaları sonsuza kadar çekilmesin.
+    for (var page = 0; page < 200; page++) {
       final Map<String, Object?> data;
       if (first) {
         first = false;
@@ -121,8 +123,9 @@ class DropboxService {
       }
       items.addAll(cloudItemsOf(data['entries']));
       if (data['has_more'] != true) break;
-      cursor = data['cursor'] as String? ?? '';
-      if (cursor.isEmpty) break;
+      final next = data['cursor'] as String? ?? '';
+      if (next.isEmpty || next == cursor) break;
+      cursor = next;
     }
     return items;
   }

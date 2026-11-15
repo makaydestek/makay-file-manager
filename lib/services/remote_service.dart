@@ -1,5 +1,6 @@
 import 'dart:convert';
 import 'dart:io';
+import 'dart:typed_data';
 
 import 'package:ftpconnect/ftpconnect.dart';
 import 'package:shared_preferences/shared_preferences.dart';
@@ -212,6 +213,11 @@ class FtpClientService {
   static (String, int?) parseHostPort(String raw) {
     var t = raw.trim();
     if (t.isEmpty) return ('', null);
+    // Windows UNC yapıştırması: \\192.168.68.180 → 192.168.68.180
+    // (Kullanıcı FTP ile IP bağlanır; SMB değildir.)
+    while (t.startsWith(r'\') || t.startsWith('/')) {
+      t = t.substring(1);
+    }
     final uri = Uri.tryParse(t);
     if (uri != null && uri.hasScheme && uri.host.isNotEmpty) {
       return (uri.host, uri.hasPort ? uri.port : null);
@@ -232,6 +238,8 @@ class FtpClientService {
     }
     final at = t.lastIndexOf('@');
     if (at >= 0) t = t.substring(at + 1);
+    // Kalan UNC eğik çizgileri / paylaşımları ayıkla.
+    t = t.replaceAll(r'\', '/');
     final slash = t.indexOf('/');
     if (slash >= 0) t = t.substring(0, slash);
     final colon = t.lastIndexOf(':');
@@ -252,7 +260,12 @@ class FtpClientService {
     final ftp = _connect(loc);
     await ftp.connect();
     try {
-      return await ftp.listDirectoryContent(path);
+      final entries = await ftp.listDirectoryContent(path);
+      // Profesyonel dosya yöneticileri gibi `.` ve `..` gösterilmez;
+      // üst dizin ayrı gezinme kontrolüyle sağlanır.
+      return entries
+          .where((e) => e.name != '.' && e.name != '..')
+          .toList(growable: false);
     } finally {
       await ftp.disconnect();
     }
@@ -267,6 +280,20 @@ class FtpClientService {
     await ftp.connect();
     try {
       await ftp.downloadFile(remotePath, target);
+    } finally {
+      await ftp.disconnect();
+    }
+  }
+
+  /// Dosyayı belleğe indirir (küçük resim önizlemesi için).
+  Future<Uint8List> downloadBytes(
+    RemoteLocation loc,
+    String remotePath,
+  ) async {
+    final ftp = _connect(loc);
+    await ftp.connect();
+    try {
+      return await ftp.downloadToBytes(remotePath);
     } finally {
       await ftp.disconnect();
     }

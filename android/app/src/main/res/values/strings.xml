@@ -1,0 +1,5 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <!-- SAF dosya seçici / Dışa aktar kök başlığı -->
+    <string name="app_documents_root_title">Makay Dosya Yöneticisi</string>
+</resources>

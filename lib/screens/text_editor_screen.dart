@@ -164,11 +164,41 @@ class _TextEditorScreenState extends State<TextEditorScreen> {
     setState(() {});
   }
 
+  /// Satır numarası sütununun genişliği.
+  static double _gutterWidth(int lines) =>
+      (lines.toString().length * 10.0).clamp(28.0, 56.0);
+
+  /// Salt-okunur görünüm için satır numaraları.
+  ///
+  /// Buraya `ListView` konamaz: içerik `SingleChildScrollView` içinde sınırsız
+  /// yükseklikle çizilir ve dikey viewport "unbounded height" hatası verir
+  /// (salt-okunur modda satır numaraları açıkken oluşan gerçek çökme buydu).
+  /// Metnin tamamı zaten tek seferde çizildiğinden Column yeterli ve doğrudur.
+  Widget _lineNumberColumn(String text, TextStyle style) {
+    final lines = text.split('\n').length;
+    final numberStyle = style.copyWith(
+      color: Theme.of(context).colorScheme.outline,
+      height: 1.4,
+    );
+    return SizedBox(
+      width: _gutterWidth(lines),
+      child: Column(
+        mainAxisSize: MainAxisSize.min,
+        crossAxisAlignment: CrossAxisAlignment.end,
+        children: [
+          for (var i = 1; i <= lines; i++)
+            Text('$i', textAlign: TextAlign.right, style: numberStyle),
+        ],
+      ),
+    );
+  }
+
+  /// Düzenleme görünümü için satır numaraları (yüksekliği sınırlı alanda
+  /// çalışır ve metin alanının kaydırmasıyla senkron sürülür).
   Widget _lineNumberGutter(String text, TextStyle style) {
     final lines = text.split('\n').length;
-    final width = (lines.toString().length * 10.0).clamp(28.0, 56.0);
     return SizedBox(
-      width: width,
+      width: _gutterWidth(lines),
       child: ListView.builder(
         controller: _scroll,
         physics: const NeverScrollableScrollPhysics(),
@@ -183,6 +213,21 @@ class _TextEditorScreenState extends State<TextEditorScreen> {
         ),
       ),
     );
+  }
+
+  /// Metin alanı kaydırıldığında satır numarası sütununu birlikte kaydırır.
+  bool _syncGutter(ScrollNotification notification) {
+    if (notification.depth != 0) return false;
+    final pixels = notification.metrics.pixels;
+    if (!_scroll.hasClients) return false;
+    // Sütun yüksekliği metinden kısa olabilir; taşarsa sessizce dur.
+    final max = _scroll.position.maxScrollExtent;
+    try {
+      _scroll.jumpTo(pixels > max ? max : pixels);
+    } catch (_) {
+      // Senkronlamanın olmaması düzenlemeyi bozmaz.
+    }
+    return false;
   }
 
   @override
@@ -320,17 +365,21 @@ class _TextEditorScreenState extends State<TextEditorScreen> {
                                       ),
                                     ),
                                   Expanded(
-                                    child: TextField(
-                                      controller: _controller,
-                                      maxLines: null,
-                                      expands: true,
-                                      keyboardType: TextInputType.multiline,
-                                      style: mono,
-                                      decoration: const InputDecoration(
-                                        border: InputBorder.none,
-                                        contentPadding: EdgeInsets.all(12),
+                                    child: NotificationListener<
+                                        ScrollNotification>(
+                                      onNotification: _syncGutter,
+                                      child: TextField(
+                                        controller: _controller,
+                                        maxLines: null,
+                                        expands: true,
+                                        keyboardType: TextInputType.multiline,
+                                        style: mono,
+                                        decoration: const InputDecoration(
+                                          border: InputBorder.none,
+                                          contentPadding: EdgeInsets.all(12),
+                                        ),
+                                        onChanged: (_) => setState(() {}),
                                       ),
-                                      onChanged: (_) => setState(() {}),
                                     ),
                                   ),
                                 ],
@@ -341,7 +390,7 @@ class _TextEditorScreenState extends State<TextEditorScreen> {
                                   crossAxisAlignment: CrossAxisAlignment.start,
                                   children: [
                                     if (_showLineNumbers) ...[
-                                      _lineNumberGutter(
+                                      _lineNumberColumn(
                                         _controller.text.length > _displayLimit
                                             ? _controller.text
                                                 .substring(0, _displayLimit)

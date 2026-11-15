@@ -3,6 +3,7 @@ import 'package:flutter_test/flutter_test.dart';
 import 'package:provider/provider.dart';
 import 'package:shared_preferences/shared_preferences.dart';
 
+import 'package:makay_file_manager/l10n/app_localizations.dart';
 import 'package:makay_file_manager/providers/settings_provider.dart';
 import 'package:makay_file_manager/screens/settings_screen.dart';
 
@@ -23,18 +24,22 @@ void main() {
           child: MaterialApp(
             theme: ThemeData.dark(),
             home: const SettingsScreen(),
+            // SettingsScreen başlığı AppLocalizations okur.
+            locale: const Locale('tr'),
+            localizationsDelegates: AppLocalizations.localizationsDelegates,
+            supportedLocales: AppLocalizations.supportedLocales,
           ),
         ),
       ),
     );
     await tester.pumpAndSettle();
 
+    // Hakkında bölümü ayarlar listesinin en üstündedir; kaydırmadan görünür.
     final about = find.text('Makay Dosya Yöneticisi');
-    await tester.scrollUntilVisible(about, 300,
-        scrollable: find.byType(Scrollable).first);
-    await tester.pumpAndSettle();
+    expect(about, findsOneWidget);
 
-    expect(find.text('Hakkında'), findsWidgets);
+    // Başlık emoji önekli ('ℹ️ Hakkında').
+    expect(find.textContaining('Hakkında'), findsWidgets);
     expect(about, findsOneWidget);
     expect(find.textContaining('Sürüm:'), findsOneWidget);
     expect(find.text('Geliştirici'), findsOneWidget);

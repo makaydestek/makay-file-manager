@@ -68,6 +68,10 @@ build_output.txt
 test_output.txt
 *_output.txt
 
+# Geçici keşif/probe betikleri (yayına girmez)
+tool/_probe_*.dart
+stop
+
 # --- E2E (integration_test) bilinçli olarak KALDIRILDI ---
 # Kullanıcı kararı: uçtan uca test katmanı bu projede YOK ve bir daha
 # eklenmeyecek. Bu klasör buraya eklenirse git'e girmez; ayrıca CI'daki

@@ -3,6 +3,7 @@ import 'dart:io';
 import 'dart:typed_data';
 
 import 'package:flutter_test/flutter_test.dart';
+import 'package:makay_file_manager/services/secure_store.dart';
 import 'package:makay_file_manager/services/vault_service.dart';
 import 'package:pointycastle/export.dart';
 import 'package:shared_preferences/shared_preferences.dart';
@@ -20,6 +21,9 @@ void main() {
     VaultService.debugRoot = root.path;
     // SharedPreferences, setMockInitialValues çağrısından sonra hazırlanır.
     SharedPreferences.setMockInitialValues({});
+    // Kasa meta verisi artık şifreli depoda tutulur; testlerde bellek içi
+    // arka uç kullanılır (aksi halde platform kanalı yoktur).
+    SecureStore.debugBackend = <String, String>{};
     VaultService.lock();
     VaultService.now = DateTime.now;
   });
@@ -28,6 +32,7 @@ void main() {
     VaultService.lock();
     VaultService.debugRoot = null;
     VaultService.now = DateTime.now;
+    SecureStore.debugBackend = null;
     if (root.existsSync()) root.deleteSync(recursive: true);
     if (outside.existsSync()) outside.deleteSync(recursive: true);
   });
@@ -75,8 +80,20 @@ void main() {
     };
     // 1.0.10 bu alanı hiç yazmıyordu; verilmezse alan yazılmaz.
     if (iterations != null) meta['kdfIterations'] = iterations;
+    // Eski sürümler prefs'e yazıyordu; servis bunu okuyup şifreli depoya taşır.
     final prefs = await SharedPreferences.getInstance();
     await prefs.setString('vault_meta', jsonEncode(meta));
+  }
+
+  /// Servisin meta veriyi yazdığı yer (önce şifreli depo, yoksa prefs).
+  Future<Map<String, dynamic>?> readMetaAnywhere() async {
+    final secure = SecureStore.debugBackend?['vault.meta.v2'];
+    if (secure != null && secure.isNotEmpty) {
+      return jsonDecode(secure) as Map<String, dynamic>;
+    }
+    final prefs = await SharedPreferences.getInstance();
+    final raw = prefs.getString('vault_meta');
+    return raw == null ? null : jsonDecode(raw) as Map<String, dynamic>;
   }
 
   /// 1.0.x dosya biçimi: [4 bayt başlık uzunluğu][başlık json][içerik],
@@ -101,8 +118,9 @@ void main() {
   }
 
   Future<Map<String, dynamic>> readRawMeta() async {
-    final prefs = await SharedPreferences.getInstance();
-    return jsonDecode(prefs.getString('vault_meta')!) as Map<String, dynamic>;
+    final meta = await readMetaAnywhere();
+    expect(meta, isNotNull, reason: 'kasa meta verisi kaydedilmeli');
+    return meta!;
   }
 
   test('create → unlocked; add → listede 1 kayıt, ad/boyut doğru',

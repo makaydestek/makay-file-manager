@@ -21,6 +21,7 @@ class MediaViewerScreen extends StatefulWidget {
     super.key,
     this.file,
     this.contentUri,
+    this.httpHeaders,
     required this.isVideo,
     this.title,
   }) : assert(file != null || contentUri != null,
@@ -32,7 +33,11 @@ class MediaViewerScreen extends StatefulWidget {
   /// Android MediaStore içerik URI'si (`content://media/...`).
   /// Albüm ekranından [AssetEntity.getMediaUrl] ile gelir; dosya kopyası
   /// başarısız olduğunda veya büyük videolarda tercih edilir.
+  /// WebDAV gibi ağ kaynaklarında `http(s)://` URI de olabilir.
   final Uri? contentUri;
+
+  /// Ağ URL'si için isteğe bağlı HTTP başlıkları (Basic Auth vb.).
+  final Map<String, String>? httpHeaders;
 
   final bool isVideo;
 
@@ -115,7 +120,11 @@ class _MediaViewerScreenState extends State<MediaViewerScreen> {
       if (uri.scheme == 'file') {
         attempts.add(() async => VideoPlayerController.file(File(uri.toFilePath())));
       } else {
-        attempts.add(() async => VideoPlayerController.networkUrl(uri));
+        final headers = widget.httpHeaders;
+        attempts.add(() async => VideoPlayerController.networkUrl(
+              uri,
+              httpHeaders: headers ?? const <String, String>{},
+            ));
       }
     }
 
@@ -156,9 +165,28 @@ class _MediaViewerScreenState extends State<MediaViewerScreen> {
     });
   }
 
+  /// Oynatıcı ilerlemesi ile yalnızca **kontrol çubuğu** yenilenir.
+  ///
+  /// Önceden her tick'te `setState(() {})` tüm Scaffold'u (AppBar, video,
+  /// butonlar) yeniden çiziyordu; saniyede birkaç kez gereksiz tam rebuild
+  /// demekti. `ValueListenableBuilder` ilerleme göstergesine bağlanmıştır.
   void _onTick() {
-    if (mounted) setState(() {});
+    _updateProgressListener();
   }
+
+  void _updateProgressListener() {
+    final c = _controller;
+    if (c == null) return;
+    final v = c.value;
+    if (!v.isInitialized) return;
+    final total = v.duration.inMilliseconds;
+    final pos = v.position.inMilliseconds;
+    final next = total <= 0 ? 0.0 : (pos / total).clamp(0.0, 1.0);
+    if ((next - _progress.value).abs() > 0.001) _progress.value = next;
+  }
+
+  /// Oynatma ilerlemesi (0..1) — yalnız ilerleme çubuğunu tazeler.
+  final ValueNotifier<double> _progress = ValueNotifier<double>(0);
 
   void _scheduleHideControls() {
     _hideTimer?.cancel();
@@ -231,6 +259,7 @@ class _MediaViewerScreenState extends State<MediaViewerScreen> {
     _hideTimer?.cancel();
     _controller?.removeListener(_onTick);
     _controller?.dispose();
+    _progress.dispose();
     SystemChrome.setEnabledSystemUIMode(SystemUiMode.edgeToEdge);
     super.dispose();
   }
@@ -471,25 +500,33 @@ class _MediaViewerScreenState extends State<MediaViewerScreen> {
     final duration = v.duration;
     final maxMs =
         duration.inMilliseconds.toDouble().clamp(1.0, double.infinity).toDouble();
-    final posMs = v.position.inMilliseconds
-        .clamp(0, duration.inMilliseconds)
-        .toDouble();
     return Padding(
       padding: const EdgeInsets.symmetric(horizontal: 12, vertical: 4),
       child: Row(
         children: [
-          Text(
-            _fmt(v.position),
-            style: const TextStyle(color: Colors.white, fontSize: 12),
+          // Yalnız ilerleme metni + slider yenilenir (tick başına tam sayfa
+          // rebuild yerine hedefli güncelleme).
+          ValueListenableBuilder<double>(
+            valueListenable: _progress,
+            builder: (context, fraction, _) => Text(
+              _fmt(Duration(
+                  milliseconds: (fraction * maxMs).round())),
+              style: const TextStyle(color: Colors.white, fontSize: 12),
+            ),
           ),
           Expanded(
-            child: Slider(
-              value: posMs,
-              max: maxMs,
-              onChanged: (value) {
-                c.seekTo(Duration(milliseconds: value.round()));
-                _scheduleHideControls();
-              },
+            child: ValueListenableBuilder<double>(
+              valueListenable: _progress,
+              builder: (context, fraction, _) => Slider(
+                value: (fraction * maxMs).clamp(0, maxMs).toDouble(),
+                max: maxMs,
+                onChanged: (value) {
+                  c.seekTo(Duration(milliseconds: value.round()));
+                  _progress.value =
+                      (value / maxMs).clamp(0.0, 1.0).toDouble();
+                  _scheduleHideControls();
+                },
+              ),
             ),
           ),
           Text(

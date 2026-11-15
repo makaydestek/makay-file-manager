@@ -193,11 +193,17 @@ jobs:
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           VER: ${{ steps.ver.outputs.version }}
+          REPO: ${{ github.repository }}
         run: |
           set -euo pipefail
-          for TAG in $(gh release list --json tagName --jq '.[].tagName'); do
+          for TAG in $(gh release list --limit 200 --json tagName --jq '.[].tagName'); do
             if [ "$TAG" != "$VER" ]; then
               gh release delete "$TAG" --yes --cleanup-tag || true
+            fi
+          done
+          for TAG in $(gh api --paginate "repos/${REPO}/tags" --jq '.[].name'); do
+            if [ "$TAG" != "$VER" ]; then
+              gh api -X DELETE "repos/${REPO}/git/refs/tags/${TAG}" || true
             fi
           done
           echo "Yalnızca ${VER} bırakıldı."

@@ -62,4 +62,32 @@ void main() {
     final next = RemoteDownload.uniqueTarget(dir, 'LICENSE');
     expect(next.path.endsWith('LICENSE (2)'), isTrue);
   });
+
+  test('uzak sunucudan gelen ad hedef klasör dışına çıkamaz', () {
+    final dir = Directory.systemTemp.createTempSync('remote_dl3_');
+    addTearDown(() {
+      if (dir.existsSync()) dir.deleteSync(recursive: true);
+    });
+
+    for (final evil in [
+      '../../evil.apk',
+      r'..\..\evil.apk',
+      '/etc/passwd',
+      r'C:\Windows\evil.dll',
+      '..',
+      '.',
+    ]) {
+      final target = RemoteDownload.uniqueTarget(dir, evil);
+      expect(target.parent.path, dir.path,
+          reason: '$evil hedef dizin içinde kalmalı');
+      expect(target.path.contains('..'), isFalse, reason: evil);
+    }
+  });
+
+  test('sanitizeFileName yol ayırıcı ve kontrol karakterlerini temizler', () {
+    expect(RemoteDownload.sanitizeFileName('a/b/c.txt'), 'c.txt');
+    expect(RemoteDownload.sanitizeFileName(r'a\b\c.txt'), 'c.txt');
+    expect(RemoteDownload.sanitizeFileName('a:b?.txt'), 'a_b_.txt');
+    expect(RemoteDownload.sanitizeFileName('  '), isNotEmpty);
+  });
 }

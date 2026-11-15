@@ -81,6 +81,10 @@ class MainActivity : FlutterFragmentActivity() {
     }
 
     /// ACTION_SEND / SEND_MULTIPLE içeriğini önbelleğe kopyalayıp bekletir.
+    ///
+    /// Samsung Browser vb. çoğu zaman URI'yi yalnız [Intent.getClipData] veya
+    /// [Intent.getData] ile verir; [Intent.EXTRA_STREAM] boş kalabilir. Hepsi
+    /// taranmazsa kayıt ekranı hiç açılmaz (Kaydet çubuğu görünmez).
     private fun captureSharedIntent(intent: Intent?) {
         if (intent == null) return
         val action = intent.action ?: return
@@ -107,26 +111,41 @@ class MainActivity : FlutterFragmentActivity() {
             // Eski kalıntıları temizle (önceki paylaşım oturumu).
             listFiles()?.forEach { it.delete() }
         }
-        when (intent.action) {
-            Intent.ACTION_SEND -> {
-                val uri = shareStreamUri(intent)
-                if (uri != null) {
-                    copySharedUri(uri, intent.type, dir)?.let { out.add(it) }
-                } else {
-                    val text = intent.getStringExtra(Intent.EXTRA_TEXT)
-                    if (!text.isNullOrBlank()) {
-                        saveSharedText(text, dir)?.let { out.add(it) }
-                    }
-                }
+        val uris = collectShareUris(intent)
+        if (uris.isNotEmpty()) {
+            for (uri in uris) {
+                copySharedUri(uri, intent.type, dir)?.let { out.add(it) }
             }
-            Intent.ACTION_SEND_MULTIPLE -> {
-                val uris = shareStreamUris(intent)
-                for (uri in uris) {
-                    copySharedUri(uri, intent.type, dir)?.let { out.add(it) }
-                }
+            return out
+        }
+        // Dosya URI yoksa metin paylaşımı (bağlantı / seçili metin).
+        if (intent.action == Intent.ACTION_SEND) {
+            val text = intent.getStringExtra(Intent.EXTRA_TEXT)
+            if (!text.isNullOrBlank()) {
+                saveSharedText(text, dir)?.let { out.add(it) }
             }
         }
         return out
+    }
+
+    /**
+     * Paylaşım URI'lerini mümkün olan tüm kaynaklardan toplar.
+     *
+     * Sıra: EXTRA_STREAM (tek) → EXTRA_STREAM (liste) → ClipData → intent.data.
+     * Samsung Internet "Dışa aktar" sıklıkla yalnızca ClipData doldurur.
+     */
+    private fun collectShareUris(intent: Intent): List<Uri> {
+        val seen = LinkedHashSet<Uri>()
+        shareStreamUri(intent)?.let { seen.add(it) }
+        seen.addAll(shareStreamUris(intent))
+        val clip = intent.clipData
+        if (clip != null) {
+            for (i in 0 until clip.itemCount) {
+                clip.getItemAt(i).uri?.let { seen.add(it) }
+            }
+        }
+        intent.data?.let { seen.add(it) }
+        return seen.toList()
     }
 
     @Suppress("DEPRECATION")
@@ -166,9 +185,8 @@ class MainActivity : FlutterFragmentActivity() {
                 ?: "paylasim_${System.currentTimeMillis()}"
             val safeName = sanitizeFileName(displayName)
             val dest = uniqueFile(dir, safeName)
-            contentResolver.openInputStream(uri)?.use { input ->
-                dest.outputStream().use { output -> input.copyTo(output) }
-            } ?: return null
+            val copied = copyUriToFile(uri, dest)
+            if (!copied) return null
             val mime = contentResolver.getType(uri)
                 ?: fallbackMime
                 ?: mimeFromPath(dest.name)
@@ -179,9 +197,41 @@ class MainActivity : FlutterFragmentActivity() {
                 "mime" to mime,
                 "size" to dest.length()
             )
-        } catch (e: Exception) {
+        } catch (_: Exception) {
             null
         }
+    }
+
+    /** openInputStream başarısız olursa AssetFileDescriptor / file:// dener. */
+    private fun copyUriToFile(uri: Uri, dest: File): Boolean {
+        try {
+            contentResolver.openInputStream(uri)?.use { input ->
+                dest.outputStream().use { output -> input.copyTo(output) }
+                return true
+            }
+        } catch (_: Exception) {
+            // Aşağıdaki yedeklere düş.
+        }
+        try {
+            contentResolver.openAssetFileDescriptor(uri, "r")?.use { afd ->
+                afd.createInputStream().use { input ->
+                    dest.outputStream().use { output -> input.copyTo(output) }
+                }
+                return true
+            }
+        } catch (_: Exception) {
+            // file:// yedeği.
+        }
+        if (uri.scheme == "file") {
+            val src = uri.path?.let { File(it) }
+            if (src != null && src.exists() && src.isFile) {
+                src.inputStream().use { input ->
+                    dest.outputStream().use { output -> input.copyTo(output) }
+                }
+                return true
+            }
+        }
+        return false
     }
 
     private fun saveSharedText(text: String, dir: File): Map<String, Any?>? {
@@ -591,6 +641,13 @@ class MainActivity : FlutterFragmentActivity() {
                         }
                     }
 
+                    "checkForUpdate" -> {
+                        // Makay Cleaner ile aynı: native HttpURLConnection + GitHub Releases.
+                        runBackground(result) {
+                            AppUpdateRepository(this).checkForUpdate()
+                        }
+                    }
+
                     "installApk" -> {
                         // Otomatik güncelleme: indirilen APK'yı kur (A15).
                         val path = call.argument<String>("path")
@@ -756,8 +813,12 @@ class MainActivity : FlutterFragmentActivity() {
                         android.graphics.pdf.PdfRenderer.Page.RENDER_MODE_FOR_DISPLAY
                     )
                     val stream = ByteArrayOutputStream()
-                    bitmap.compress(Bitmap.CompressFormat.JPEG, 85, stream)
-                    bitmap.recycle()
+                    try {
+                        bitmap.compress(Bitmap.CompressFormat.JPEG, 85, stream)
+                    } finally {
+                        // Hata yolunda da native bitmap serbest bırakılır.
+                        bitmap.recycle()
+                    }
                     mapOf(
                         "pageCount" to count,
                         "page" to idx,
@@ -793,7 +854,23 @@ class MainActivity : FlutterFragmentActivity() {
             val h = (frame.height * scale).toInt().coerceAtLeast(1)
             val small = android.graphics.Bitmap.createScaledBitmap(frame, w, h, true)
             val out = java.io.ByteArrayOutputStream()
-            small.compress(android.graphics.Bitmap.CompressFormat.JPEG, 78, out)
+            try {
+                small.compress(android.graphics.Bitmap.CompressFormat.JPEG, 78, out)
+            } finally {
+                // Retriever'in döndürdüğü orijinal kare ve ölçekli kopya
+                // (aynı nesne değilse) serbest bırakılır — aksi halde her
+                // video önizlemesi native bitmap sızdırıyordu.
+                if (small !== frame) {
+                    try {
+                        small.recycle()
+                    } catch (_: Exception) {
+                    }
+                }
+                try {
+                    frame.recycle()
+                } catch (_: Exception) {
+                }
+            }
             out.toByteArray()
         } catch (e: Exception) {
             null

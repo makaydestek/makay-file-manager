@@ -249,6 +249,7 @@ class _BrowserScreenState extends State<BrowserScreen>
     List<FileEntry> entries, {
     required bool showHidden,
   }) async {
+    final found = <String, int?>{};
     for (final e in entries) {
       if (!e.isDirectory) continue;
       int? count;
@@ -269,9 +270,17 @@ class _BrowserScreenState extends State<BrowserScreen>
       } catch (_) {
         count = null;
       }
-      if (!mounted) return;
-      setState(() => _childCounts[e.path] = count);
+      found[e.path] = count;
+      // Her 20 klasörde bir tekrar çizim: önceden klasör BAŞINA bir
+      // setState vardı (100 klasör = 100 tam yeniden çizim + bileşenlerde
+      // önizlemelerin yeniden istenmesi).
+      if (found.length % 20 == 0 && mounted) {
+        setState(() => _childCounts.addAll(found));
+        found.clear();
+      }
     }
+    if (!mounted) return;
+    if (found.isNotEmpty) setState(() => _childCounts.addAll(found));
   }
 
   List<FileEntry> _sort(List<FileEntry> entries) {

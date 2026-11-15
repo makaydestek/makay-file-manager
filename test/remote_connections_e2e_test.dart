@@ -176,7 +176,8 @@ void main() {
 
   testWidgets('WebDAV: şemasız adres normalize edilir, hata sonrası Kaydet',
       (tester) async {
-    await openForm(tester, 'WebDAV');
+    // Tür seçicideki gerçek etiket 'WebDAV / Nextcloud'.
+    await openForm(tester, 'WebDAV / Nextcloud');
     // Test gövdesinde gerçek ağ I/O'su beklenemez → kapalı port sabit.
     const closedPort = 1;
 

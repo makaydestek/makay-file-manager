@@ -129,6 +129,10 @@ class _MakayAppState extends State<MakayApp> with WidgetsBindingObserver {
       _checkUpdate();
       await _checkLockGate();
       await _openPendingShare();
+      // Samsung Browser vb.: native taraf URI'yi arka planda kopyalar;
+      // ilk takeSharedFiles boş dönebilir — kısa gecikmeyle bir kez daha bak.
+      await Future<void>.delayed(const Duration(milliseconds: 600));
+      if (mounted) await _openPendingShare();
     });
   }
 
@@ -284,7 +288,21 @@ class _MakayAppState extends State<MakayApp> with WidgetsBindingObserver {
         tvFocus: tvFocus,
       ),
       themeMode: settings.themeMode,
-      locale: const Locale('tr'),
+      // Cihaz dili destekliyse (tr/en) o kullanılır; aksi halde Türkçe.
+      // Sabit `Locale('tr')` sistem dilini yok sayıyordu.
+      locale: settings.localeCode == null
+          ? null
+          : Locale(settings.localeCode!),
+      localeResolutionCallback: (locale, supported) {
+        // Kullanıcı elle dil seçtiyse o dil geçerlidir.
+        final forced = settings.localeCode;
+        if (forced != null) return Locale(forced);
+        if (locale == null) return const Locale('tr');
+        for (final s in supported) {
+          if (s.languageCode == locale.languageCode) return s;
+        }
+        return const Locale('tr');
+      },
       supportedLocales: AppLocalizations.supportedLocales,
       localizationsDelegates: [
         AppLocalizations.delegate,
@@ -376,6 +394,10 @@ class _BrowseLauncher extends StatelessWidget {
 
   final String categoryId;
 
+  /// Kategori kök yolları süreç ömrü boyunca önbelleklenir; her rebuild'de
+  /// yeni Future üretilirse FutureBuilder yeniden `waiting`e düşer.
+  static final Map<String, Future<String?>> _rootFutures = {};
+
   @override
   Widget build(BuildContext context) {
     final category = kHomeCategories.where((c) => c.id == categoryId).firstOrNull;
@@ -389,7 +411,8 @@ class _BrowseLauncher extends StatelessWidget {
       );
     }
     return FutureBuilder<String?>(
-      future: AppPaths.byCategory(categoryId),
+      future:
+          _rootFutures.putIfAbsent(categoryId, () => AppPaths.byCategory(categoryId)),
       builder: (context, snapshot) {
         if (!snapshot.hasData) {
           return const Scaffold(

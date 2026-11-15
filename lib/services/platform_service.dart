@@ -395,7 +395,7 @@ class PlatformService {
     }
     final raw = await _channel.invokeMethod<List<dynamic>>(
       'listNativeArchive',
-      {'path': path, if (password != null) 'password': password},
+      {'path': path, 'password': ?password},
     );
     return [
       for (final e in raw ?? const [])
@@ -418,8 +418,8 @@ class PlatformService {
       {
         'path': path,
         'destDir': destDir,
-        if (password != null) 'password': password,
-        if (entryName != null) 'entryName': entryName,
+        'password': ?password,
+        'entryName': ?entryName,
       },
     );
     return n ?? 0;

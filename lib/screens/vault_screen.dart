@@ -152,10 +152,12 @@ class _VaultScreenState extends State<VaultScreen> {
     await VaultService.create(pin);
     // Ekran, kilidi yeniden kapatıp PIN girişini ister.
     VaultService.lock();
+    // Controller'lar ekrandan çıkıldıysa dispose edilmiştir; mounted
+    // kontrolü temizlikten ÖNCE yapılmalı.
+    if (!mounted) return;
     _pin.clear();
     _pinConfirm.clear();
     _pinCreate.clear();
-    if (!mounted) return;
     setState(() => _loading = false);
     await _refresh();
   }

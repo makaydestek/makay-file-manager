@@ -1,3 +1,4 @@
+import 'dart:async';
 import 'dart:io';
 import 'dart:math';
 
@@ -12,8 +13,9 @@ import '../widgets/tv_focusable.dart';
 /// Ağdan erişim ekranı: gömülü FTP/FTPS ve SMB2 sunucularını başlat/durdur.
 ///
 /// Referans uygulamadaki "Ağdan erişim" ekranının karşılığı: sunucu adresi
-/// `ftp://<ip>:6586`, kullanıcı adı `admin`, şifre 4 haneli rakam (her
-/// açılışta değişir), gizli dosyaları göster, BAŞLAT/DURDUR.
+/// `ftp://<ip>:6586`, kullanıcı adı `admin`, şifre her açılışta üretilen güçlü
+/// rastgele parola (panoya kopyalanabilir), gizli dosyaları göster,
+/// BAŞLAT/DURDUR.
 class NetworkAccessScreen extends StatefulWidget {
   const NetworkAccessScreen({super.key});
 
@@ -31,14 +33,22 @@ class _NetworkAccessScreenState extends State<NetworkAccessScreen> {
   bool _readOnly = false;
 
   /// Paylaşılan kök: 'internal' | 'downloads'
-  String _shareRoot = 'internal';
+  /// Varsayılan İndirilenler — Android'de yazma izni daha güvenilir (F-FM tarzı).
+  String _shareRoot = 'downloads';
 
-  /// Referans uygulamayla birebir: FTP kullanıcısı `admin`,
-  /// şifre her açılışta 4 haneli rastgele rakam.
+  /// FTP kullanıcısı `admin`; şifre her açılışta üretilen güçlü parola.
   final _username = 'admin';
   String _password = '';
   String _ipAddress = '…';
   final _rng = Random.secure();
+
+  /// Sunucu log abonelikleri — dispose'da iptal edilir. Saklanmazsa her
+  /// BAŞLAT yeni bir abonelik ekler ve eski abonelik State'i tutmaya devam eder.
+  StreamSubscription<String>? _ftpLogSub;
+  StreamSubscription<String>? _smbLogSub;
+
+  /// Hızlı çift dokunuşla iki sunucu örneği üretilmesini engelleyen kilit.
+  bool _starting = false;
 
   @override
   void initState() {
@@ -75,78 +85,111 @@ class _NetworkAccessScreenState extends State<NetworkAccessScreen> {
     if (mounted) setState(() => _ipAddress = ip!);
   }
 
-  /// F Dosya Yöneticisi tarzı: kolay yazılır 4 haneli rakam (1000–9999).
+  /// Kopyalanabilir güçlü parola (karışabilecek 0/O, 1/l/I harıç).
+  /// Eskiden 4 haneli rakamdı (9.000 olasılık) — LAN'da saniyeler içinde
+  /// kaba kuvvetle kırılıyordu; artık ~10^18 olasılıklı ve panoya kopyalanıyor.
   String _generatePassword() {
-    final n = 1000 + _rng.nextInt(9000);
-    return n.toString();
+    const alphabet = 'ABCDEFGHJKLMNPQRSTUVWXYZabcdefghijkmnopqrstuvwxyz23456789';
+    return List.generate(
+        12, (_) => alphabet[_rng.nextInt(alphabet.length)]).join();
+  }
+
+  void _listenFtpLog(MiniFtpServer server) {
+    // Eski abonelik (önceki çalıştırma) iptal edilir; yoksa log satırları
+    // her BAŞLAT'ta birden fazla kez birikir.
+    _ftpLogSub?.cancel();
+    _ftpLogSub = server.log.listen((line) {
+      if (!mounted) return;
+      setState(() {
+        _logLines.add(line);
+        if (_logLines.length > 200) _logLines.removeAt(0);
+      });
+    });
   }
 
   Future<void> _toggle() async {
     if (_server?.running ?? false) {
       await _server!.stop();
-      setState(() {});
+      if (mounted) setState(() {});
       return;
     }
-    final root = await AppPaths.byCategory(_shareRoot);
-    final server = MiniFtpServer(
-      rootPath: root ?? '/',
-      port: 6586,
-      tlsPort: 6588,
-      username: _username,
-      password: _password,
-      showHidden: _showHidden,
-      readOnly: _readOnly,
-    );
-    server.log.listen((line) {
+    if (_starting) return; // çift dokunuş → iki sunucu örneği üretmesin
+    _starting = true;
+    try {
+      final root = await AppPaths.byCategory(_shareRoot);
+      final server = MiniFtpServer(
+        rootPath: root ?? '/',
+        port: 6586,
+        tlsPort: 6588,
+        username: _username,
+        password: _password,
+        showHidden: _showHidden,
+        readOnly: _readOnly,
+      );
+      _listenFtpLog(server);
+      try {
+        await server.start();
+        if (mounted) setState(() => _server = server);
+      } catch (e) {
+        await _ftpLogSub?.cancel();
+        _ftpLogSub = null;
+        await server.stop();
+        if (mounted) {
+          ScaffoldMessenger.of(context).showSnackBar(
+            SnackBar(content: Text('Sunucu başlatılamadı: $e')),
+          );
+        }
+      }
+    } finally {
+      _starting = false;
+    }
+  }
+
+  void _listenSmbLog(MiniSmbServer server) {
+    _smbLogSub?.cancel();
+    _smbLogSub = server.log.listen((line) {
       if (!mounted) return;
       setState(() {
         _logLines.add(line);
         if (_logLines.length > 200) _logLines.removeAt(0);
       });
     });
-    try {
-      await server.start();
-      if (mounted) setState(() => _server = server);
-    } catch (e) {
-      if (mounted) {
-        ScaffoldMessenger.of(context).showSnackBar(
-          SnackBar(content: Text('Sunucu başlatılamadı: $e')),
-        );
-      }
-    }
   }
 
   Future<void> _toggleSmb() async {
     if (_smb?.running ?? false) {
       await _smb!.stop();
-      setState(() {});
+      if (mounted) setState(() {});
       return;
     }
-    final root = await AppPaths.byCategory(_shareRoot);
-    final server = MiniSmbServer(
-      rootPath: root ?? '/',
-      port: 445,
-      shareName: 'makay',
-      showHidden: _showHidden,
-      username: _username,
-      password: _password,
-    );
-    server.log.listen((line) {
-      if (!mounted) return;
-      setState(() {
-        _logLines.add(line);
-        if (_logLines.length > 200) _logLines.removeAt(0);
-      });
-    });
+    if (_starting) return;
+    _starting = true;
     try {
-      await server.start();
-      if (mounted) setState(() => _smb = server);
-    } catch (e) {
-      if (mounted) {
-        ScaffoldMessenger.of(context).showSnackBar(
-          SnackBar(content: Text('SMB sunucusu başlatılamadı: $e')),
-        );
+      final root = await AppPaths.byCategory(_shareRoot);
+      final server = MiniSmbServer(
+        rootPath: root ?? '/',
+        port: 445,
+        shareName: 'makay',
+        showHidden: _showHidden,
+        username: _username,
+        password: _password,
+      );
+      _listenSmbLog(server);
+      try {
+        await server.start();
+        if (mounted) setState(() => _smb = server);
+      } catch (e) {
+        await _smbLogSub?.cancel();
+        _smbLogSub = null;
+        await server.stop();
+        if (mounted) {
+          ScaffoldMessenger.of(context).showSnackBar(
+            SnackBar(content: Text('SMB sunucusu başlatılamadı: $e')),
+          );
+        }
       }
+    } finally {
+      _starting = false;
     }
   }
 
@@ -228,16 +271,19 @@ class _NetworkAccessScreenState extends State<NetworkAccessScreen> {
                       title: Text('Şifre: $_password',
                           style: theme.textTheme.titleMedium?.copyWith(
                             fontFamily: 'monospace',
-                            letterSpacing: 4,
+                            letterSpacing: 1.5,
                           )),
                       trailing: IconButton(
                         tooltip: 'Kopyala',
                         icon: const Icon(Icons.copy_rounded),
                         onPressed: () async {
+                          // Konteynerler await'ten ÖNCE yakalanır; async gap
+                          // sonrası `context` kullanımı böylece güvenli olur.
+                          final messenger = ScaffoldMessenger.of(context);
                           await Clipboard.setData(
                               ClipboardData(text: _password));
                           if (!mounted) return;
-                          ScaffoldMessenger.of(context).showSnackBar(
+                          messenger.showSnackBar(
                             const SnackBar(
                                 content: Text('Şifre panoya kopyalandı')),
                           );
@@ -249,7 +295,8 @@ class _NetworkAccessScreenState extends State<NetworkAccessScreen> {
                       decoration: const InputDecoration(
                         labelText: 'Şifre',
                         border: OutlineInputBorder(),
-                        helperText: 'Kısa rakam önerilir (örn. 4 hane)',
+                        helperText:
+                            'Güçlü bir parola önerilir (en az 8 karakter)',
                       ),
                       keyboardType: TextInputType.number,
                       enabled: !running,
@@ -417,6 +464,10 @@ class _NetworkAccessScreenState extends State<NetworkAccessScreen> {
 
   @override
   void dispose() {
+    // Log abonelikleri iptal edilmezse State closure'ı ve stream bağları
+    // ekrandan çıkıldıktan sonra yaşamaya devam eder.
+    _ftpLogSub?.cancel();
+    _smbLogSub?.cancel();
     _server?.stop();
     _smb?.stop();
     super.dispose();

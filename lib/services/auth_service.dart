@@ -1,11 +1,15 @@
 import 'dart:convert';
+import 'dart:isolate';
 import 'dart:math';
-import 'dart:typed_data';
+
+import 'package:pointycastle/export.dart';
 
 import 'package:crypto/crypto.dart';
 import 'package:flutter/foundation.dart';
 import 'package:local_auth/local_auth.dart';
 import 'package:shared_preferences/shared_preferences.dart';
+
+import 'secure_store.dart';
 
 /// Uygulama kilidi + biyometri (parmak izi / yüz) servisi.
 ///
@@ -74,8 +78,39 @@ class AuthService {
 
   static Future<bool> get hasPin async {
     final p = await _prefs;
-    return (p.getString(_pinHashKey) ?? '').isNotEmpty &&
+    final prefsHas = (p.getString(_pinHashKey) ?? '').isNotEmpty &&
         (p.getString(_pinSaltKey) ?? '').isNotEmpty;
+    if (prefsHas) return true;
+    try {
+      final secureHash = await SecureStore.read(_pinHashKey);
+      final secureSalt = await SecureStore.read(_pinSaltKey);
+      return (secureHash ?? '').isNotEmpty && (secureSalt ?? '').isNotEmpty;
+    } catch (_) {
+      return false;
+    }
+  }
+
+  /// PIN özeti/tuzu: önce şifreli depo, yoksa eski prefs kaydı (migrasyon).
+  static Future<({String salt, String hash})?> _readPinRecord() async {
+    try {
+      final secureHash = await SecureStore.read(_pinHashKey);
+      final secureSalt = await SecureStore.read(_pinSaltKey);
+      if ((secureHash ?? '').isNotEmpty && (secureSalt ?? '').isNotEmpty) {
+        return (salt: secureSalt!, hash: secureHash!);
+      }
+    } catch (_) {}
+    final p = await _prefs;
+    final hash = p.getString(_pinHashKey);
+    final salt = p.getString(_pinSaltKey);
+    if ((hash ?? '').isEmpty || (salt ?? '').isEmpty) return null;
+    // Eski prefs kaydı: şifreli depoya taşı, düz kopyayı sil.
+    try {
+      await SecureStore.write(_pinHashKey, hash!);
+      await SecureStore.write(_pinSaltKey, salt!);
+      await p.remove(_pinHashKey);
+      await p.remove(_pinSaltKey);
+    } catch (_) {}
+    return (salt: salt!, hash: hash!);
   }
 
   // ----------------------------------------------------------- biyometri --
@@ -111,8 +146,18 @@ class AuthService {
 
   // ----------------------------------------------------------- PIN --
 
-  static const int pinMin = 4;
+  static const int pinMin = 6;
   static const int pinMax = 12;
+
+  /// PBKDF2-HMAC-SHA256 tur sayısı (kasa ile aynı sertlik sınıfı).
+  ///
+  /// PIN uzayı küçüktür; kilit HIZLI açılmalı ama çevrimdışı kaba kuvvete
+  /// dayanıklı olmalı. Kasa erişimi 200.000 tur kullandığı için 100.000 tur
+  /// (~60–120 ms) kilit ekranında fark edilmez bir gecikmedir.
+  static const int kdfIterations = 100000;
+
+  /// Yeni biçim önekı (eski kayıtlar öneksiz 5.001×SHA-256'dır).
+  static const String _kdfPrefix = 'pbkdf2-sha256:';
 
   static Future<void> setPin(String pin) async {
     if (pin.length < pinMin || pin.length > pinMax) {
@@ -122,21 +167,36 @@ class AuthService {
       throw ArgumentError('PIN yalnızca rakam olmalı');
     }
     final salt = _randomBytes(16);
-    final hash = _hashPin(pin, salt);
+    final hash = await _derivePinAsync(pin, salt);
+    await SecureStore.write(_pinSaltKey, base64Encode(salt));
+    await SecureStore.write(_pinHashKey,
+        '$_kdfPrefix$kdfIterations:${base64Encode(hash)}');
+    // Eski düz kopya varsa temizlenir (yedeğe sızmasın).
     final p = await _prefs;
-    await p.setString(_pinSaltKey, base64Encode(salt));
-    await p.setString(_pinHashKey, base64Encode(hash));
+    await p.remove(_pinSaltKey);
+    await p.remove(_pinHashKey);
   }
 
   static Future<bool> verifyPin(String pin) async {
     if (await lockoutRemaining() > Duration.zero) return false;
-    final p = await _prefs;
-    final saltB64 = p.getString(_pinSaltKey);
-    final hashB64 = p.getString(_pinHashKey);
-    if (saltB64 == null || hashB64 == null) return false;
-    final salt = base64Decode(saltB64);
-    final expected = base64Decode(hashB64);
-    final actual = _hashPin(pin, salt);
+    final record = await _readPinRecord();
+    if (record == null) return false;
+    final salt = base64Decode(record.salt);
+    final stored = record.hash;
+    Uint8List expected;
+    Uint8List actual;
+    if (stored.startsWith(_kdfPrefix)) {
+      final rest = stored.substring(_kdfPrefix.length);
+      final sep = rest.indexOf(':');
+      final iterations = sep > 0 ? int.tryParse(rest.substring(0, sep)) : null;
+      expected = base64Decode(rest.substring(sep + 1));
+      actual = await _derivePinAsync(pin, salt,
+          iterations: iterations ?? kdfIterations);
+    } else {
+      // Eski kayıt: 5.001×SHA-256. Doğrulanınca yeni PBKDF2'ye yükseltilir.
+      expected = base64Decode(stored);
+      actual = _hashPinLegacy(pin, salt);
+    }
     if (actual.length != expected.length) {
       await _registerFailure();
       return false;
@@ -150,10 +210,26 @@ class AuthService {
       return false;
     }
     await _clearLockout();
+    // Şeffaf yükseltme: legacy özet doğru açıldıysa yeni KDF ile yeniden yaz.
+    if (!stored.startsWith(_kdfPrefix)) {
+      try {
+        final newSalt = _randomBytes(16);
+        final newHash = await _derivePinAsync(pin, newSalt);
+        await SecureStore.write(_pinSaltKey, base64Encode(newSalt));
+        await SecureStore.write(_pinHashKey,
+            '$_kdfPrefix$kdfIterations:${base64Encode(newHash)}');
+      } catch (_) {
+        // Yükseltme başarısız olsa da giriş geçerli.
+      }
+    }
     return true;
   }
 
   static Future<void> clearPin() async {
+    try {
+      await SecureStore.delete(_pinHashKey);
+      await SecureStore.delete(_pinSaltKey);
+    } catch (_) {}
     final p = await _prefs;
     await p.remove(_pinHashKey);
     await p.remove(_pinSaltKey);
@@ -248,15 +324,32 @@ class AuthService {
 
   // ----------------------------------------------------------- yardımcılar --
 
-  static Uint8List _hashPin(String pin, List<int> salt) {
+  /// Eski (1.0.x) özet: 5.001×SHA-256. Yalnızca geriye dönük doğrulama için.
+  static Uint8List _hashPinLegacy(String pin, List<int> salt) {
     final data = <int>[...salt, ...utf8.encode(pin)];
-    // Birkaç tur SHA-256 ile basit yavaşlatma (kasa PBKDF2 kadar ağır değil;
-    // uygulama kilidi kısa PIN + cihazda biyometri ile tamamlanır).
     var digest = sha256.convert(data).bytes;
     for (var i = 0; i < 5000; i++) {
       digest = sha256.convert([...salt, ...digest]).bytes;
     }
     return Uint8List.fromList(digest);
+  }
+
+  /// PBKDF2-HMAC-SHA256 (izolatta) — GPU tabanlı kaba kuvveti pahalılaştırır.
+  static Future<Uint8List> _derivePinAsync(
+    String pin,
+    Uint8List salt, {
+    int? iterations,
+  }) {
+    final request = (
+      pin: pin,
+      salt: Uint8List.fromList(salt),
+      iterations: iterations ?? kdfIterations,
+    );
+    return Isolate.run(() {
+      final derivator = PBKDF2KeyDerivator(HMac(SHA256Digest(), 64));
+      derivator.init(Pbkdf2Parameters(request.salt, request.iterations, 32));
+      return derivator.process(Uint8List.fromList(utf8.encode(request.pin)));
+    });
   }
 
   static Uint8List _randomBytes(int n) {

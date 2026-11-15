@@ -68,7 +68,10 @@ class OAuthService {
         error = params['error_description'] ?? params['error'];
       } else if (params['code'] == null) {
         error = 'Doğrulama kodu alınamadı';
-      } else if (params['state'] != null && params['state'] != state) {
+      } else if (params['state'] != state) {
+        // state **zorunludur**: yokluğu da hata sayılır. Aksi halde aynı
+        // cihazdaki bir uygulama loopback callback'ine kendi `code`'unu
+        // enjekte edebilirdi (login CSRF / kod enjeksiyonu).
         error = 'Güvenlik doğrulaması başarısız (state)';
       } else {
         try {
@@ -165,17 +168,21 @@ class OAuthService {
     required String body,
     bool appLink = false,
   }) {
+    // Başlık/gövde sağlayıcı yanıtından gelebilir (hata metni); HTML'e
+    // yazılmadan önce kaçışlanır.
+    final safeTitle = htmlEscape.convert(title);
+    final safeBody = htmlEscape.convert(body);
     return '<!doctype html><html lang="tr"><head>'
         '<meta charset="utf-8">'
         '<meta name="viewport" content="width=device-width, initial-scale=1">'
-        '<title>$title</title>'
+        '<title>$safeTitle</title>'
         '<style>body{font-family:system-ui,sans-serif;background:#00897B;'
         'color:#fff;display:flex;align-items:center;justify-content:center;'
         'min-height:100vh;margin:0;text-align:center}'
         '.c{background:rgba(255,255,255,.14);padding:32px;border-radius:16px;'
         'max-width:420px}h1{font-size:22px;margin:0 0 12px}p{line-height:1.5;'
         'margin:0 0 16px}a{color:#fff;font-weight:700}</style>'
-        '</head><body><div class="c"><h1>$title</h1><p>$body</p>'
+        '</head><body><div class="c"><h1>$safeTitle</h1><p>$safeBody</p>'
         '${appLink ? '<a href="makayfm://oauth">Uygulamaya dön</a>' : ''}'
         '</div></body></html>';
   }

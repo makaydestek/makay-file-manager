@@ -162,7 +162,38 @@ mixin BrowserFileActions<W extends StatefulWidget> on State<W> {
     }
     final controller =
         TextEditingController(text: RootService.parseMode(current) ?? '644');
-    final mode = await showDialog<String>(
+    String? mode;
+    try {
+      mode = await _showChmodDialog(controller, current, e);
+    } finally {
+      controller.dispose();
+    }
+    if (mode == null || mode.isEmpty) return;
+    try {
+      final ok = await RootService.chmod(e.path, mode);
+      if (!mounted) return;
+      ScaffoldMessenger.of(context).showSnackBar(
+        SnackBar(
+          content: Text(ok
+              ? 'İzinler güncellendi: $mode'
+              : 'chmod başarısız oldu'),
+        ),
+      );
+      if (ok && mounted) browserReload();
+    } catch (err) {
+      if (!mounted) return;
+      ScaffoldMessenger.of(context).showSnackBar(
+        SnackBar(content: Text('Hata: $err')),
+      );
+    }
+  }
+
+  Future<String?> _showChmodDialog(
+    TextEditingController controller,
+    String current,
+    FileEntry e,
+  ) {
+    return showDialog<String>(
       context: context,
       builder: (context) => AlertDialog(
         title: const Text('İzinleri değiştir (chmod)'),
@@ -197,24 +228,6 @@ mixin BrowserFileActions<W extends StatefulWidget> on State<W> {
         ],
       ),
     );
-    if (mode == null || mode.isEmpty) return;
-    try {
-      final ok = await RootService.chmod(e.path, mode);
-      if (!mounted) return;
-      ScaffoldMessenger.of(context).showSnackBar(
-        SnackBar(
-          content: Text(ok
-              ? 'İzinler güncellendi: $mode'
-              : 'chmod başarısız oldu'),
-        ),
-      );
-      if (ok && mounted) browserReload();
-    } catch (err) {
-      if (!mounted) return;
-      ScaffoldMessenger.of(context).showSnackBar(
-        SnackBar(content: Text('Hata: $err')),
-      );
-    }
   }
 
   /// Çift panel sürükle-bırak: ayara göre kopyala / taşı / sor.
@@ -573,27 +586,32 @@ mixin BrowserFileActions<W extends StatefulWidget> on State<W> {
 
   Future<void> rename(FileEntry e) async {
     final controller = TextEditingController(text: e.name);
-    final newName = await showDialog<String>(
-      context: context,
-      builder: (context) => AlertDialog(
-        title: const Text('Yeniden adlandır'),
-        content: TextField(
-          controller: controller,
-          autofocus: true,
-          decoration: const InputDecoration(labelText: 'Yeni ad'),
+    String? newName;
+    try {
+      newName = await showDialog<String>(
+        context: context,
+        builder: (context) => AlertDialog(
+          title: const Text('Yeniden adlandır'),
+          content: TextField(
+            controller: controller,
+            autofocus: true,
+            decoration: const InputDecoration(labelText: 'Yeni ad'),
+          ),
+          actions: [
+            TextButton(
+              onPressed: () => Navigator.pop(context),
+              child: const Text('İptal'),
+            ),
+            FilledButton(
+              onPressed: () => Navigator.pop(context, controller.text.trim()),
+              child: const Text('Tamam'),
+            ),
+          ],
         ),
-        actions: [
-          TextButton(
-            onPressed: () => Navigator.pop(context),
-            child: const Text('İptal'),
-          ),
-          FilledButton(
-            onPressed: () => Navigator.pop(context, controller.text.trim()),
-            child: const Text('Tamam'),
-          ),
-        ],
-      ),
-    );
+      );
+    } finally {
+      controller.dispose();
+    }
     if (newName == null || newName.isEmpty || newName == e.name) return;
     try {
       await browserService.rename(e.path, newName);
@@ -616,27 +634,32 @@ mixin BrowserFileActions<W extends StatefulWidget> on State<W> {
 
   Future<void> newFolder() async {
     final controller = TextEditingController();
-    final name = await showDialog<String>(
-      context: context,
-      builder: (context) => AlertDialog(
-        title: const Text('Yeni klasör'),
-        content: TextField(
-          controller: controller,
-          autofocus: true,
-          decoration: const InputDecoration(labelText: 'Klasör adı'),
+    String? name;
+    try {
+      name = await showDialog<String>(
+        context: context,
+        builder: (context) => AlertDialog(
+          title: const Text('Yeni klasör'),
+          content: TextField(
+            controller: controller,
+            autofocus: true,
+            decoration: const InputDecoration(labelText: 'Klasör adı'),
+          ),
+          actions: [
+            TextButton(
+              onPressed: () => Navigator.pop(context),
+              child: const Text('İptal'),
+            ),
+            FilledButton(
+              onPressed: () => Navigator.pop(context, controller.text.trim()),
+              child: const Text('Oluştur'),
+            ),
+          ],
         ),
-        actions: [
-          TextButton(
-            onPressed: () => Navigator.pop(context),
-            child: const Text('İptal'),
-          ),
-          FilledButton(
-            onPressed: () => Navigator.pop(context, controller.text.trim()),
-            child: const Text('Oluştur'),
-          ),
-        ],
-      ),
-    );
+      );
+    } finally {
+      controller.dispose();
+    }
     if (name == null || name.isEmpty) return;
     final created = '$browserPath${Platform.pathSeparator}$name';
     try {

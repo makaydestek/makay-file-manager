@@ -82,6 +82,12 @@ void main() {
     expect(WebDavService.normalizeUrl('next.site.com/dav'),
         'https://next.site.com/dav');
     expect(WebDavService.normalizeUrl('https://x.com/dav/'), 'https://x.com/dav');
-    expect(WebDavService.normalizeUrl('  http://y.com  '), 'http://y.com');
+    // Düz http, Basic Auth sızmasın diye HTTPS'e yükseltilir.
+    expect(WebDavService.normalizeUrl('  http://y.com  '), 'https://y.com');
+    // Loopback (yerel test sunucusu) http olarak kalır.
+    expect(WebDavService.normalizeUrl('http://127.0.0.1:8080/dav'),
+        'http://127.0.0.1:8080/dav');
+    expect(WebDavService.normalizeUrl('http://localhost:8080/dav'),
+        'http://localhost:8080/dav');
   });
 }

@@ -1,11 +1,11 @@
 import 'package:flutter/material.dart';
 
-import '../services/remote_download.dart';
+import '../models/remote_item.dart';
 import '../services/remote_service.dart';
 import '../services/webdav_service.dart';
-import '../utils/formats.dart';
+import 'remote/remote_browse_scaffold.dart';
 
-/// WebDAV sunucusunda gezinme: dizin listesi + dosya indirme.
+/// WebDAV gezinme (ortak F-FM tarzı uzak tarayıcı + ağ önizleme).
 class WebDavBrowseScreen extends StatefulWidget {
   const WebDavBrowseScreen({super.key, required this.location});
 
@@ -19,7 +19,7 @@ class _WebDavBrowseScreenState extends State<WebDavBrowseScreen> {
   static const _service = WebDavService();
 
   String _path = '/';
-  List<DavEntry> _entries = [];
+  List<RemoteItem> _items = [];
   bool _loading = true;
   String? _error;
 
@@ -31,22 +31,51 @@ class _WebDavBrowseScreenState extends State<WebDavBrowseScreen> {
         password: widget.location.password,
       );
 
+  String get _locationKey => widget.location.secretKey;
+
   @override
   void initState() {
     super.initState();
-    _path = widget.location.startPath;
+    _path = widget.location.startPath.isEmpty
+        ? '/'
+        : widget.location.startPath;
     _load();
+  }
+
+  String _join(String name) =>
+      _path.endsWith('/') ? '$_path$name' : '$_path/$name';
+
+  List<(String, String)> get _crumbs {
+    final segments = _path.split('/').where((s) => s.isNotEmpty).toList();
+    final out = <(String, String)>[('/', '/')];
+    for (var i = 0; i < segments.length; i++) {
+      out.add((segments[i], '/${segments.sublist(0, i + 1).join('/')}'));
+    }
+    return out;
   }
 
   Future<void> _load() async {
     setState(() {
       _loading = true;
       _error = null;
+      _items = [];
     });
     try {
       final entries = await _service.list(_cloud, path: _path);
       if (!mounted) return;
-      setState(() => _entries = entries);
+      setState(() {
+        _items = [
+          for (final e in entries)
+            RemoteItem(
+              name: e.name,
+              remotePath: _join(e.name),
+              isDir: e.isDir,
+              size: e.size,
+              modified: e.modified,
+            ),
+        ];
+        _error = null;
+      });
     } catch (e) {
       if (!mounted) return;
       setState(() => _error = 'Liste alınamadı: $e');
@@ -55,16 +84,9 @@ class _WebDavBrowseScreenState extends State<WebDavBrowseScreen> {
     }
   }
 
-  void _open(DavEntry entry) {
-    if (entry.isDir) {
-      final next = _path.endsWith('/')
-          ? '$_path${entry.name}'
-          : '$_path/${entry.name}';
-      setState(() => _path = next);
-      _load();
-    } else {
-      _download(entry);
-    }
+  void _openDir(RemoteItem item) {
+    setState(() => _path = item.remotePath);
+    _load();
   }
 
   void _goUp() {
@@ -75,109 +97,32 @@ class _WebDavBrowseScreenState extends State<WebDavBrowseScreen> {
     _load();
   }
 
-  Future<void> _download(DavEntry entry) async {
-    final remote = _path.endsWith('/')
-        ? '$_path${entry.name}'
-        : '$_path/${entry.name}';
-    if (!mounted) return;
-    // Download klasörüne iner; APK ise bitince Kur/Güncelle diyaloğu açılır.
-    await RemoteDownload.run(
-      context,
-      fileName: entry.name,
-      transfer: (target) => _service.download(_cloud, remote, target),
-    );
-  }
-
   @override
   Widget build(BuildContext context) {
-    final theme = Theme.of(context);
-    return Scaffold(
-      appBar: AppBar(
-        title: Text('${widget.location.name} (WebDAV)'),
-        bottom: PreferredSize(
-          preferredSize: const Size.fromHeight(36),
-          child: Padding(
-            padding: const EdgeInsets.fromLTRB(16, 0, 16, 8),
-            child: Row(
-              children: [
-                const Icon(Icons.cloud_rounded, size: 16),
-                const SizedBox(width: 8),
-                Expanded(
-                  child: Text(
-                    _path,
-                    maxLines: 1,
-                    overflow: TextOverflow.ellipsis,
-                    style: theme.textTheme.bodySmall,
-                  ),
-                ),
-              ],
-            ),
-          ),
-        ),
-      ),
-      body: _loading
-          ? const Center(child: CircularProgressIndicator())
-          : _error != null
-              ? Center(
-                  child: Padding(
-                    padding: const EdgeInsets.all(24),
-                    child: Column(
-                      mainAxisSize: MainAxisSize.min,
-                      children: [
-                        const Icon(Icons.error_outline_rounded,
-                            size: 48, color: Colors.redAccent),
-                        const SizedBox(height: 12),
-                        Text(_error!, textAlign: TextAlign.center),
-                        const SizedBox(height: 12),
-                        FilledButton(
-                          onPressed: _load,
-                          child: const Text('Tekrar dene'),
-                        ),
-                      ],
-                    ),
-                  ),
-                )
-              : RefreshIndicator(
-                  onRefresh: _load,
-                  child: _entries.isEmpty
-                      ? ListView(
-                          children: const [
-                            SizedBox(height: 120),
-                            Center(child: Text('Bu dizin boş')),
-                          ],
-                        )
-                      : ListView.builder(
-                          itemCount: _entries.length + 1,
-                          itemBuilder: (context, index) {
-                            if (index == 0) {
-                              if (_path == '/') return const SizedBox.shrink();
-                              return ListTile(
-                                leading:
-                                    const Icon(Icons.drive_folder_upload),
-                                title: const Text('..'),
-                                onTap: _goUp,
-                              );
-                            }
-                            final e = _entries[index - 1];
-                            return ListTile(
-                              leading: Icon(
-                                e.isDir
-                                    ? Icons.folder_rounded
-                                    : Icons.insert_drive_file_rounded,
-                                color: e.isDir
-                                    ? const Color(0xFFFFB300)
-                                    : theme.colorScheme.primary,
-                              ),
-                              title: Text(e.name,
-                                  maxLines: 1,
-                                  overflow: TextOverflow.ellipsis),
-                              subtitle:
-                                  Text(e.isDir ? 'Klasör' : Formats.size(e.size)),
-                              onTap: () => _open(e),
-                            );
-                          },
-                        ),
-                ),
+    return RemoteBrowseScaffold(
+      title: '${widget.location.name} (WebDAV)',
+      subtitleIcon: Icons.cloud_rounded,
+      pathLabel: _path,
+      crumbs: _crumbs,
+      canGoUp: _path != '/' && _path.isNotEmpty,
+      locationKey: _locationKey,
+      items: _items,
+      loading: _loading,
+      error: _error,
+      onRefresh: _load,
+      onOpenDir: _openDir,
+      onGoUp: _goUp,
+      onCrumb: (path) {
+        setState(() => _path = path);
+        _load();
+      },
+      download: (item, target) =>
+          _service.download(_cloud, item.remotePath, target),
+      fetchBytes: (item) =>
+          _service.downloadBytes(_cloud, item.remotePath),
+      networkUrlFor: (item) =>
+          item.isDir ? null : WebDavService.fileUri(_cloud, item.remotePath),
+      httpHeaders: WebDavService.authHeaders(_cloud),
     );
   }
 }

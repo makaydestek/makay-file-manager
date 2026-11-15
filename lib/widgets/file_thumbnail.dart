@@ -32,6 +32,21 @@ class FileThumbnail extends StatelessWidget {
   /// Yuvarlatılmış köşe yarıçapı.
   final double borderRadius;
 
+  /// Video karesi isteği yalnızca **bir kez** yapılır.
+  ///
+  /// Future `build` içinde üretilirse her rebuild'te yeniden oluşur ve
+  /// FutureBuilder `waiting`e döner: görsel titrer, her seferinde
+  /// MediaMetadataRetriever ile video açılıp ilk kare decode edilir (tarayıcı
+  /// listesinde her setState bunu tetikliyordu).
+  static final Map<String, Future<Uint8List?>> _videoFutures = {};
+
+  Future<Uint8List?>? _videoFuture(String path) {
+    if (!PlatformService.supported) return null;
+    if (PlatformService.cachedVideoThumbnail(path) != null) return null;
+    return _videoFutures.putIfAbsent(
+        path, () => PlatformService.videoThumbnail(path));
+  }
+
   @override
   Widget build(BuildContext context) {
     final radius = BorderRadius.circular(borderRadius);
@@ -56,12 +71,8 @@ class FileThumbnail extends StatelessWidget {
             width: size,
             height: size,
             child: FutureBuilder<Uint8List?>(
-              // Önce önbellek; değilse platformdan ilk kare.
-              future: PlatformService.supported
-                  ? (PlatformService.cachedVideoThumbnail(entry.path) != null
-                      ? null
-                      : PlatformService.videoThumbnail(entry.path))
-                  : null,
+              // Önce önbellek; değilse platformdan ilk kare (memoize edilmiş).
+              future: _videoFuture(entry.path),
               builder: (context, snapshot) {
                 final bytes = snapshot.data ??
                     PlatformService.cachedVideoThumbnail(entry.path);

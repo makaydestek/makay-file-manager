@@ -36,6 +36,9 @@
         android:icon="@mipmap/ic_launcher"
         android:banner="@drawable/tv_banner"
         android:largeHeap="true"
+        android:allowBackup="false"
+        android:fullBackupContent="false"
+        android:dataExtractionRules="@xml/data_extraction_rules"
         android:requestLegacyExternalStorage="true">
         <activity
             android:name=".MainActivity"
@@ -97,6 +100,19 @@
             <meta-data
                 android:name="android.support.FILE_PROVIDER_PATHS"
                 android:resource="@xml/file_paths"/>
+        </provider>
+        <!-- Sistem "Dışa aktar / Kaydet / Dosya seç" (SAF DocumentsProvider).
+             Diğer uygulamalar ACTION_CREATE_DOCUMENT ile kayıt yeri seçerken
+             bu uygulama F Dosya Yöneticisi gibi kök olarak görünür. -->
+        <provider
+            android:name=".MakayDocumentsProvider"
+            android:authorities="${applicationId}.documents"
+            android:exported="true"
+            android:grantUriPermissions="true"
+            android:permission="android.permission.MANAGE_DOCUMENTS">
+            <intent-filter>
+                <action android:name="android.content.action.DOCUMENTS_PROVIDER"/>
+            </intent-filter>
         </provider>
     </application>
     <!-- Required to query activities that can process text, see:

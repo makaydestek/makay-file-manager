@@ -34,6 +34,7 @@ class SettingsProvider extends ChangeNotifier {
   static const _kForceDualPane = 'force_dual_pane';
   static const _kDropAction = 'drop_action'; // ask | copy | move
   static const _kDualPaneMinWidth = 'dual_pane_min_width';
+  static const _kLocale = 'locale';
 
   static Future<SettingsProvider> load() async =>
       SettingsProvider(await SharedPreferences.getInstance());
@@ -108,6 +109,21 @@ class SettingsProvider extends ChangeNotifier {
 
   set storageWarnPercent(int value) {
     _prefs.setInt(_kStorageWarnPercent, value);
+    notifyListeners();
+  }
+
+  /// Arayüz dili: null → cihaz dili (destekleniyorsa), aksi halde Türkçe.
+  String? get localeCode {
+    final v = _prefs.getString(_kLocale);
+    return (v == null || v.isEmpty || v == 'system') ? null : v;
+  }
+
+  set localeCode(String? value) {
+    if (value == null || value.isEmpty || value == 'system') {
+      _prefs.remove(_kLocale);
+    } else {
+      _prefs.setString(_kLocale, value);
+    }
     notifyListeners();
   }
 

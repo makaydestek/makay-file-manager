@@ -3,12 +3,12 @@ import 'dart:io';
 import 'package:flutter/material.dart';
 import 'package:path_provider/path_provider.dart';
 
-import '../services/remote_download.dart';
+import '../models/remote_item.dart';
 import '../services/remote_service.dart';
 import '../services/smb_client.dart';
-import '../utils/formats.dart';
+import 'remote/remote_browse_scaffold.dart';
 
-/// SMB paylaşımında gezinme: liste, indirme, yükleme, klasör, silme, yeniden adlandırma.
+/// SMB paylaşımında gezinme (ortak F-FM tarzı uzak tarayıcı).
 class SmbBrowseScreen extends StatefulWidget {
   const SmbBrowseScreen({super.key, required this.location});
 
@@ -21,10 +21,27 @@ class SmbBrowseScreen extends StatefulWidget {
 class _SmbBrowseScreenState extends State<SmbBrowseScreen> {
   SmbClient? _client;
   String _path = '';
-  List<SmbEntry> _entries = [];
+  List<RemoteItem> _items = [];
   bool _loading = true;
   bool _busy = false;
   String? _error;
+
+  String get _locationKey => widget.location.secretKey;
+
+  String get _displayPath => '\\\\${widget.location.host}\\'
+      '${widget.location.share.isEmpty ? 'C\$' : widget.location.share}'
+      '${_path.isEmpty ? '' : '\\$_path'}';
+
+  List<(String, String)> get _crumbs {
+    final share = widget.location.share.isEmpty ? 'C\$' : widget.location.share;
+    final out = <(String, String)>[(share, '')];
+    if (_path.isEmpty) return out;
+    final segments = _path.split(r'\').where((s) => s.isNotEmpty).toList();
+    for (var i = 0; i < segments.length; i++) {
+      out.add((segments[i], segments.sublist(0, i + 1).join(r'\')));
+    }
+    return out;
+  }
 
   @override
   void initState() {
@@ -39,19 +56,55 @@ class _SmbBrowseScreenState extends State<SmbBrowseScreen> {
     super.dispose();
   }
 
+  String _join(String name) => _path.isEmpty ? name : '$_path\\$name';
+
   Future<void> _connect() async {
     setState(() {
       _loading = true;
       _error = null;
+      _items = [];
     });
     try {
       _client ??= await SmbClient.connect(widget.location);
       final entries = await _client!.list(_path);
       if (!mounted) return;
-      setState(() => _entries = entries);
+      setState(() {
+        _items = [
+          for (final e in entries)
+            RemoteItem(
+              name: e.name,
+              remotePath: _join(e.name),
+              isDir: e.isDir,
+              size: e.size,
+              modified: e.modified,
+            ),
+        ];
+        _error = null;
+      });
     } on SmbException catch (e) {
-      if (!mounted) return;
-      setState(() => _error = e.message);
+      // Oturum koptuysa bir kez yeniden bağlan (photo gibi büyük klasörler).
+      try {
+        _client?.destroy();
+        _client = await SmbClient.connect(widget.location);
+        final entries = await _client!.list(_path);
+        if (!mounted) return;
+        setState(() {
+          _items = [
+            for (final e in entries)
+              RemoteItem(
+                name: e.name,
+                remotePath: _join(e.name),
+                isDir: e.isDir,
+                size: e.size,
+                modified: e.modified,
+              ),
+          ];
+          _error = null;
+        });
+      } catch (_) {
+        if (!mounted) return;
+        setState(() => _error = e.message);
+      }
     } catch (e) {
       if (!mounted) return;
       setState(() => _error = 'Bağlantı/liste hatası: $e');
@@ -60,14 +113,9 @@ class _SmbBrowseScreenState extends State<SmbBrowseScreen> {
     }
   }
 
-  void _open(SmbEntry entry) {
-    if (entry.isDir) {
-      final next = _path.isEmpty ? entry.name : '$_path\\${entry.name}';
-      setState(() => _path = next);
-      _connect();
-    } else {
-      _download(entry);
-    }
+  void _openDir(RemoteItem item) {
+    setState(() => _path = item.remotePath);
+    _connect();
   }
 
   void _goUp() {
@@ -77,20 +125,10 @@ class _SmbBrowseScreenState extends State<SmbBrowseScreen> {
     _connect();
   }
 
-  Future<void> _download(SmbEntry entry) async {
-    final remote = _path.isEmpty ? entry.name : '$_path\\${entry.name}';
-    if (!mounted) return;
-    await RemoteDownload.run(
-      context,
-      fileName: entry.name,
-      transfer: (target) => _client!.download(remote, target),
-    );
-  }
-
   Future<void> _mkdir() async {
     final name = await _askText('Yeni klasör', 'Klasör adı');
     if (name == null || name.trim().isEmpty || _client == null) return;
-    final remote = _path.isEmpty ? name.trim() : '$_path\\${name.trim()}';
+    final remote = _join(name.trim());
     setState(() => _busy = true);
     try {
       await _client!.mkdir(remote);
@@ -106,14 +144,10 @@ class _SmbBrowseScreenState extends State<SmbBrowseScreen> {
   }
 
   Future<void> _upload() async {
-    // Yerel dosya seçimi: Download klasöründen basit diyalog.
     final root = Directory('/storage/emulated/0/Download');
     final fallback = await getApplicationDocumentsDirectory();
     final dir = root.existsSync() ? root : fallback;
-    final files = dir
-        .listSync()
-        .whereType<File>()
-        .toList()
+    final files = dir.listSync().whereType<File>().toList()
       ..sort((a, b) => b.path.compareTo(a.path));
     if (!mounted) return;
     if (files.isEmpty) {
@@ -147,7 +181,7 @@ class _SmbBrowseScreenState extends State<SmbBrowseScreen> {
     );
     if (picked == null || _client == null) return;
     final name = picked.path.split(Platform.pathSeparator).last;
-    final remote = _path.isEmpty ? name : '$_path\\$name';
+    final remote = _join(name);
     setState(() => _busy = true);
     try {
       await _client!.upload(remote, picked);
@@ -171,15 +205,13 @@ class _SmbBrowseScreenState extends State<SmbBrowseScreen> {
     }
   }
 
-  Future<void> _rename(SmbEntry entry) async {
-    final neu = await _askText('Yeniden adlandır', 'Yeni ad',
-        initial: entry.name);
-    if (neu == null || neu.trim().isEmpty || neu.trim() == entry.name) return;
-    final from = _path.isEmpty ? entry.name : '$_path\\${entry.name}';
+  Future<void> _rename(RemoteItem item) async {
+    final neu = await _askText('Yeniden adlandır', 'Yeni ad', initial: item.name);
+    if (neu == null || neu.trim().isEmpty || neu.trim() == item.name) return;
     final to = _path.isEmpty ? neu.trim() : '$_path\\${neu.trim()}';
     setState(() => _busy = true);
     try {
-      await _client!.rename(from, to);
+      await _client!.rename(item.remotePath, to);
       if (mounted) await _connect();
     } on SmbException catch (e) {
       if (mounted) {
@@ -191,12 +223,12 @@ class _SmbBrowseScreenState extends State<SmbBrowseScreen> {
     }
   }
 
-  Future<void> _delete(SmbEntry entry) async {
+  Future<void> _delete(RemoteItem item) async {
     final ok = await showDialog<bool>(
       context: context,
       builder: (ctx) => AlertDialog(
         title: const Text('Sil'),
-        content: Text('"${entry.name}" kalıcı olarak silinsin mi?'),
+        content: Text('"${item.name}" kalıcı olarak silinsin mi?'),
         actions: [
           TextButton(
               onPressed: () => Navigator.pop(ctx, false),
@@ -208,10 +240,9 @@ class _SmbBrowseScreenState extends State<SmbBrowseScreen> {
       ),
     );
     if (ok != true || _client == null) return;
-    final remote = _path.isEmpty ? entry.name : '$_path\\${entry.name}';
     setState(() => _busy = true);
     try {
-      await _client!.delete(remote, isDir: entry.isDir);
+      await _client!.delete(item.remotePath, isDir: item.isDir);
       if (mounted) await _connect();
     } on SmbException catch (e) {
       if (mounted) {
@@ -249,170 +280,65 @@ class _SmbBrowseScreenState extends State<SmbBrowseScreen> {
     );
   }
 
-  void _rowMenu(SmbEntry e) {
-    showModalBottomSheet<void>(
-      context: context,
-      builder: (ctx) => SafeArea(
-        child: Column(
-          mainAxisSize: MainAxisSize.min,
-          children: [
-            ListTile(
-              title: Text(e.name, maxLines: 1, overflow: TextOverflow.ellipsis),
-              subtitle: Text(e.isDir ? 'Klasör' : Formats.size(e.size)),
+  @override
+  Widget build(BuildContext context) {
+    return Stack(
+      children: [
+        RemoteBrowseScaffold(
+          title: '${widget.location.name} (SMB)',
+          subtitleIcon: Icons.folder_shared_rounded,
+          pathLabel: _displayPath,
+          crumbs: _crumbs,
+          canGoUp: _path.isNotEmpty,
+          locationKey: _locationKey,
+          items: _items,
+          loading: _loading,
+          error: _error,
+          onRefresh: _connect,
+          onOpenDir: _openDir,
+          onGoUp: _goUp,
+          onCrumb: (path) {
+            setState(() => _path = path);
+            _connect();
+          },
+          download: (item, target) =>
+              _client!.download(item.remotePath, target),
+          fetchBytes: (item) => _client!.downloadBytes(item.remotePath),
+          extraActions: [
+            IconButton(
+              icon: const Icon(Icons.create_new_folder_rounded),
+              tooltip: 'Yeni klasör',
+              onPressed: _busy || _loading || _error != null ? null : _mkdir,
             ),
-            const Divider(height: 1),
-            if (!e.isDir)
-              ListTile(
-                leading: const Icon(Icons.download_rounded),
-                title: const Text('İndir'),
-                onTap: () {
-                  Navigator.pop(ctx);
-                  _download(e);
-                },
-              ),
+            IconButton(
+              icon: const Icon(Icons.upload_file_rounded),
+              tooltip: 'Dosya yükle',
+              onPressed: _busy || _loading || _error != null ? null : _upload,
+            ),
+          ],
+          extraMenuItems: (ctx, item, close) => [
             ListTile(
               leading: const Icon(Icons.drive_file_rename_outline_rounded),
               title: const Text('Yeniden adlandır'),
               onTap: () {
-                Navigator.pop(ctx);
-                _rename(e);
+                close();
+                _rename(item);
               },
             ),
             ListTile(
               leading: const Icon(Icons.delete_outline_rounded),
               title: const Text('Sil'),
               onTap: () {
-                Navigator.pop(ctx);
-                _delete(e);
+                close();
+                _delete(item);
               },
             ),
           ],
         ),
-      ),
-    );
-  }
-
-  String get _displayPath => '\\\\${widget.location.host}\\'
-      '${widget.location.share.isEmpty ? 'C\$' : widget.location.share}'
-      '${_path.isEmpty ? '' : '\\$_path'}';
-
-  @override
-  Widget build(BuildContext context) {
-    final theme = Theme.of(context);
-    return Scaffold(
-      appBar: AppBar(
-        title: Text('${widget.location.name} (SMB)'),
-        actions: [
-          IconButton(
-            icon: const Icon(Icons.create_new_folder_rounded),
-            tooltip: 'Yeni klasör',
-            onPressed: _busy || _loading || _error != null ? null : _mkdir,
-          ),
-          IconButton(
-            icon: const Icon(Icons.upload_file_rounded),
-            tooltip: 'Dosya yükle',
-            onPressed: _busy || _loading || _error != null ? null : _upload,
-          ),
-        ],
-        bottom: PreferredSize(
-          preferredSize: const Size.fromHeight(36),
-          child: Padding(
-            padding: const EdgeInsets.fromLTRB(16, 0, 16, 8),
-            child: Row(
-              children: [
-                const Icon(Icons.folder_shared_rounded, size: 16),
-                const SizedBox(width: 8),
-                Expanded(
-                  child: Text(
-                    _displayPath,
-                    maxLines: 1,
-                    overflow: TextOverflow.ellipsis,
-                    style: theme.textTheme.bodySmall,
-                  ),
-                ),
-              ],
-            ),
-          ),
-        ),
-      ),
-      body: Stack(
-        children: [
-          _loading
-              ? const Center(child: CircularProgressIndicator())
-              : _error != null
-                  ? Center(
-                      child: Padding(
-                        padding: const EdgeInsets.all(24),
-                        child: Column(
-                          mainAxisSize: MainAxisSize.min,
-                          children: [
-                            const Icon(Icons.error_outline_rounded,
-                                size: 48, color: Colors.redAccent),
-                            const SizedBox(height: 12),
-                            Text(_error!, textAlign: TextAlign.center),
-                            const SizedBox(height: 12),
-                            FilledButton(
-                              onPressed: _connect,
-                              child: const Text('Tekrar dene'),
-                            ),
-                          ],
-                        ),
-                      ),
-                    )
-                  : RefreshIndicator(
-                      onRefresh: _connect,
-                      child: _entries.isEmpty
-                          ? ListView(
-                              children: const [
-                                SizedBox(height: 120),
-                                Center(child: Text('Bu dizin boş')),
-                              ],
-                            )
-                          : ListView.builder(
-                              itemCount: _entries.length + 1,
-                              itemBuilder: (context, index) {
-                                if (index == 0) {
-                                  if (_path.isEmpty) {
-                                    return const SizedBox.shrink();
-                                  }
-                                  return ListTile(
-                                    leading: const Icon(
-                                        Icons.drive_folder_upload),
-                                    title: const Text('..'),
-                                    onTap: _goUp,
-                                  );
-                                }
-                                final e = _entries[index - 1];
-                                return ListTile(
-                                  leading: Icon(
-                                    e.isDir
-                                        ? Icons.folder_rounded
-                                        : Icons.insert_drive_file_rounded,
-                                    color: e.isDir
-                                        ? const Color(0xFFFFB300)
-                                        : theme.colorScheme.primary,
-                                  ),
-                                  title: Text(e.name,
-                                      maxLines: 1,
-                                      overflow: TextOverflow.ellipsis),
-                                  subtitle: Text(
-                                      e.isDir ? 'Klasör' : Formats.size(e.size)),
-                                  trailing: IconButton(
-                                    icon: const Icon(Icons.more_vert_rounded),
-                                    onPressed: () => _rowMenu(e),
-                                  ),
-                                  onTap: () => _open(e),
-                                  onLongPress: () => _rowMenu(e),
-                                );
-                              },
-                            ),
-                    ),
-          if (_busy)
-            const ModalBarrier(dismissible: false, color: Color(0x33000000)),
-          if (_busy)
-            const Center(child: CircularProgressIndicator()),
-        ],
-      ),
+        if (_busy)
+          const ModalBarrier(dismissible: false, color: Color(0x33000000)),
+        if (_busy) const Center(child: CircularProgressIndicator()),
+      ],
     );
   }
 }

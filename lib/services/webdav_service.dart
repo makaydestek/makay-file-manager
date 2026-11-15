@@ -1,5 +1,6 @@
 import 'dart:convert';
 import 'dart:io';
+import 'dart:typed_data';
 
 import 'package:shared_preferences/shared_preferences.dart';
 import 'package:xml/xml.dart';
@@ -132,11 +133,17 @@ class CloudLocationStore {
 
 /// WebDAV dizin girişi.
 class DavEntry {
-  DavEntry({required this.name, required this.isDir, this.size = 0});
+  DavEntry({
+    required this.name,
+    required this.isDir,
+    this.size = 0,
+    this.modified,
+  });
 
   final String name;
   final bool isDir;
   final int size;
+  final DateTime? modified;
 }
 
 /// Minimal WebDAV istemcisi: PROPFIND ile dizin listeleme.
@@ -147,15 +154,30 @@ class WebDavService {
   ///
   /// Kullanıcı "next.site.com/remote.php/dav" gibi bir adres yazdığında
   /// `https://` öneki eklenir; sondaki eğik çizgi de kırpılır.
+  ///
+  /// Güvenlik: Basic Auth başlığıyla birlikte kullanıldığı için düz `http://`
+  /// adresler HTTPS'e yükseltilir — kullanıcı adı/şifre Base64 olarak açık
+  /// ağdan geçmez. (Yalnızca loopback adreslerinde http korunur: yerel test
+  /// sunucuları.)
   static String normalizeUrl(String url) {
     var t = url.trim();
     if (t.isEmpty) return t;
     final parsed = Uri.tryParse(t);
-    if (parsed == null || !parsed.hasScheme) t = 'https://$t';
+    if (parsed == null || !parsed.hasScheme) {
+      t = 'https://$t';
+    } else if (parsed.scheme.toLowerCase() == 'http' &&
+        !_isLoopback(parsed.host)) {
+      t = 'https://${t.substring(t.indexOf('://') + 3)}';
+    }
     while (t.endsWith('/')) {
       t = t.substring(0, t.length - 1);
     }
     return t;
+  }
+
+  static bool _isLoopback(String host) {
+    final h = host.toLowerCase();
+    return h == 'localhost' || h == '::1' || h.startsWith('127.');
   }
 
   /// [path] WebDAV köküne göre yol ('/' ile başlar).
@@ -179,7 +201,7 @@ class WebDavService {
         '<?xml version="1.0" encoding="utf-8"?>'
         '<D:propfind xmlns:D="DAV:">'
         '<D:prop><D:displayname/><D:resourcetype/>'
-        '<D:getcontentlength/></D:prop></D:propfind>',
+        '<D:getcontentlength/><D:getlastmodified/></D:prop></D:propfind>',
       );
       final resp = await req.close();
       final body = await resp.transform(utf8.decoder).join();
@@ -213,7 +235,17 @@ class WebDavService {
       final size = int.tryParse(
               prop.getElement('D:getcontentlength')?.innerText ?? '') ??
           0;
-      entries.add(DavEntry(name: name, isDir: isDir, size: size));
+      final modRaw = prop.getElement('D:getlastmodified')?.innerText;
+      DateTime? modified;
+      if (modRaw != null && modRaw.isNotEmpty) {
+        try {
+          modified = HttpDate.parse(modRaw);
+        } catch (_) {
+          modified = DateTime.tryParse(modRaw);
+        }
+      }
+      entries.add(
+          DavEntry(name: name, isDir: isDir, size: size, modified: modified));
     }
     entries.sort((a, b) {
       if (a.isDir != b.isDir) return a.isDir ? -1 : 1;
@@ -222,26 +254,71 @@ class WebDavService {
     return entries;
   }
 
+  /// Dosya için mutlak WebDAV URL'si.
+  ///
+  /// Yolun her segmenti URI-encode edilir: boşluk, `#`, `?` içeren adlarda
+  /// istek bozuluyordu. Geçersiz bir kaçış dizisinde segment olduğu gibi
+  /// kodlanır (çökmek yerine güvenli davranış).
+  static Uri fileUri(CloudLocation loc, String path) {
+    final base = normalizeUrl(loc.url);
+    final raw = path.isEmpty ? '/' : path;
+    final encoded = raw.split('/').map((seg) {
+      try {
+        return Uri.encodeComponent(Uri.decodeComponent(seg));
+      } on FormatException {
+        return Uri.encodeComponent(seg);
+      }
+    }).join('/');
+    return Uri.parse('$base$encoded');
+  }
+
+  /// Basic Auth başlığı.
+  static Map<String, String> authHeaders(CloudLocation loc) => {
+        HttpHeaders.authorizationHeader:
+            'Basic ${base64Encode(utf8.encode('${loc.username}:${loc.password}'))}',
+      };
+
   /// [path] dosyasını yerel [target] dosyasına indirir (HTTP GET).
   Future<void> download(
     CloudLocation loc,
     String path,
     File target,
   ) async {
-    final base = normalizeUrl(loc.url);
-    final uri = Uri.parse('$base${path.isEmpty ? '/' : path}');
+    final uri = fileUri(loc, path);
     final client = HttpClient()..connectionTimeout = const Duration(seconds: 15);
     try {
       final req = await client.getUrl(uri);
-      req.headers.set(
-        HttpHeaders.authorizationHeader,
-        'Basic ${base64Encode(utf8.encode('${loc.username}:${loc.password}'))}',
-      );
+      for (final e in authHeaders(loc).entries) {
+        req.headers.set(e.key, e.value);
+      }
       final resp = await req.close();
       if (resp.statusCode != 200) {
         throw HttpException('Sunucu ${resp.statusCode} yanıtı verdi');
       }
       await resp.pipe(target.openWrite());
+    } finally {
+      client.close(force: true);
+    }
+  }
+
+  /// Dosyayı belleğe indirir (küçük resim önizlemesi için).
+  Future<Uint8List> downloadBytes(CloudLocation loc, String path) async {
+    final uri = fileUri(loc, path);
+    final client = HttpClient()..connectionTimeout = const Duration(seconds: 15);
+    try {
+      final req = await client.getUrl(uri);
+      for (final e in authHeaders(loc).entries) {
+        req.headers.set(e.key, e.value);
+      }
+      final resp = await req.close();
+      if (resp.statusCode != 200) {
+        throw HttpException('Sunucu ${resp.statusCode} yanıtı verdi');
+      }
+      final builder = BytesBuilder(copy: false);
+      await for (final chunk in resp) {
+        builder.add(chunk);
+      }
+      return builder.takeBytes();
     } finally {
       client.close(force: true);
     }

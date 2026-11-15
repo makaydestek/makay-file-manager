@@ -52,6 +52,14 @@ if errorlevel 1 (
 
 echo.
 echo [1/5] APK derleniyor (tek yapilandirma, birkac dakika surebilir)...
+REM Imza anahtari yoksa gradle derlemeyi durdurur (debug imzali APK uretmez).
+if not exist "android\key.properties" (
+  echo.
+  echo [HATA] android\key.properties bulunamadi - release imzalanamaz.
+  echo        Yayin icin keystore yapilandirin ^(docs\KEYSTORE YEDEKLEME.md^).
+  pause
+  exit /b 1
+)
 call flutter build apk --release
 if errorlevel 1 (
   echo.
@@ -73,6 +81,11 @@ rem parantezli blogu parse edemeden betigi o satirda keser.
 copy /y "%OUT%" "APK\MakayFileManager-%VER%.apk" >nul
 if not exist "APK\MakayFileManager-%VER%.apk" (
   echo [HATA] APK kopyalanamadi - APK klasorune yazma izni yok?
+  pause
+  exit /b 1
+)
+powershell -NoProfile -ExecutionPolicy Bypass -File "%~dp0tool\verify-apk-version.ps1" -ApkPath "%~dp0APK\MakayFileManager-%VER%.apk" -ExpectedVersion "%VER%"
+if errorlevel 1 (
   pause
   exit /b 1
 )
@@ -140,6 +153,19 @@ if errorlevel 1 (
 )
 
 echo.
+where gh >nul 2>&1
+if errorlevel 1 (
+  echo [HATA] GitHub CLI bulunamadi.
+  echo        Kurulum: winget install --id GitHub.cli
+  pause
+  exit /b 1
+)
+gh auth status >nul 2>&1
+if errorlevel 1 (
+  echo [HATA] GitHub oturumu yok. Once Gh-Giris.bat calistirin.
+  pause
+  exit /b 1
+)
 echo [5/5] GitHub Release olusturuluyor...
 gh release view "%VER%" >nul 2>&1
 if errorlevel 1 goto :createrelease
@@ -162,7 +188,7 @@ rem mesaji ("Yayin: MakayFileManager v...") biciminde gosterir.
 gh api -X POST repos/:owner/:repo/releases -f tag_name=%VER%
 if errorlevel 1 (
   echo.
-  echo [HATA] GitHub Release olusturulamadi. "gh auth status" ile
+  echo [HATA] GitHub Release olusturulamadi. Gh-Giris.bat ile
   echo        oturumu kontrol edin.
   pause
   exit /b 1
@@ -196,8 +222,15 @@ if %ASSETS% LSS %EXPECTED% (
 echo Release dogrulandi (asset: %ASSETS%).
 
 echo Eski GitHub surumleri siliniyor (yalnizca %VER% kalir)...
-for /f "delims=" %%T in ('gh release list --json tagName -q ".[].tagName" 2^>nul') do (
-  if not "%%T"=="%VER%" gh release delete "%%T" --yes --cleanup-tag >nul 2>&1
+gh api "repos/%REPO%/tags" --paginate --jq ".[].name" > "%TEMP%\mf_all_tags.txt" 2>nul
+for /f "delims=" %%T in ('gh release list --limit 200 --json tagName -q ".[].tagName" 2^>nul') do (
+  if /i not "%%T"=="%VER%" gh release delete "%%T" --yes --cleanup-tag >nul 2>&1
+)
+if exist "%TEMP%\mf_all_tags.txt" (
+  for /f "usebackq delims=" %%T in ("%TEMP%\mf_all_tags.txt") do (
+    if /i not "%%T"=="%VER%" gh api -X DELETE "repos/%REPO%/git/refs/tags/%%T" >nul 2>&1
+  )
+  del /q "%TEMP%\mf_all_tags.txt" >nul 2>&1
 )
 
 start "" "%~dp0APK"

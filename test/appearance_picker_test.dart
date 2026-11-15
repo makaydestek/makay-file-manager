@@ -3,6 +3,7 @@ import 'package:flutter_test/flutter_test.dart';
 import 'package:provider/provider.dart';
 import 'package:shared_preferences/shared_preferences.dart';
 
+import 'package:makay_file_manager/l10n/app_localizations.dart';
 import 'package:makay_file_manager/providers/settings_provider.dart';
 import 'package:makay_file_manager/screens/settings_screen.dart';
 import 'package:makay_file_manager/theme/app_appearance.dart';
@@ -21,7 +22,14 @@ void main() {
     await tester.pumpWidget(
       ChangeNotifierProvider<SettingsProvider>.value(
         value: settings,
-        child: const MaterialApp(home: SettingsScreen()),
+        // SettingsScreen başlığı AppLocalizations okur; üretimde MaterialApp'e
+        // verilen delegate testte de sağlanmazsa null çöker.
+        child: const MaterialApp(
+          home: SettingsScreen(),
+          locale: Locale('tr'),
+          localizationsDelegates: AppLocalizations.localizationsDelegates,
+          supportedLocales: AppLocalizations.supportedLocales,
+        ),
       ),
     );
     await tester.pumpAndSettle();
@@ -34,12 +42,18 @@ void main() {
     expect(find.text('Görünüm'), findsOneWidget);
     // Varsayılan: Klasik — açıklama satırda görünür.
     expect(find.textContaining('Klasik'), findsWidgets);
+    // Satır gerçekten görünür durumda olmalı (kaydırma gerekmiyor).
+    expect(find.widgetWithText(ListTile, 'Görünüm'), findsOneWidget);
   });
 
   testWidgets('Seçim diyaloğu her preset\'i önizlemeyle sunar', (tester) async {
     await pumpSettings(tester);
 
-    await tester.tap(find.text('Görünüm'));
+    // 'Görünüm' satırı (tam metin) — 'Görünüm düzeni' ile karışmasın.
+    final row = find.widgetWithText(ListTile, 'Görünüm');
+    await tester.ensureVisible(row);
+    await tester.pumpAndSettle();
+    await tester.tap(row);
     await tester.pumpAndSettle();
 
     expect(find.text('Görünüm seçin'), findsOneWidget);
@@ -64,7 +78,10 @@ void main() {
     final provider = await pumpSettings(tester);
     expect(provider.appearance, AppAppearance.klasik);
 
-    await tester.tap(find.text('Görünüm'));
+    final row = find.widgetWithText(ListTile, 'Görünüm');
+    await tester.ensureVisible(row);
+    await tester.pumpAndSettle();
+    await tester.tap(row);
     await tester.pumpAndSettle();
     await tester.tap(find.text('Canlı & Yuvarlak'));
     await tester.pumpAndSettle();

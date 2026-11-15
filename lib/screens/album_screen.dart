@@ -74,6 +74,9 @@ class _AlbumScreenState extends State<AlbumScreen> {
   final Set<String> _selected = {};
   final _searchController = TextEditingController();
   bool _loading = true;
+
+  /// Bir sayfa isteği uçuşta mı (itemBuilder'ın mükerrer isteğini engeller).
+  bool _fetching = false;
   bool _hasMore = true;
   bool _working = false;
   bool _searchActive = false;
@@ -94,7 +97,10 @@ class _AlbumScreenState extends State<AlbumScreen> {
       _query.trim().isNotEmpty;
 
   /// Ada göre sıralama için başlıklar (asset kimliği → dosya adı).
-  static final Map<String, String> _titleCache = {};
+  ///
+  /// Ekran kapanınca temizlenir: `static` tutulduğunda uygulama ömrü boyunca
+  /// büyüyüp binlerce öğede MB'larca String biriktiriyordu.
+  final Map<String, String> _titleCache = {};
 
   bool get _selecting => _selected.isNotEmpty;
 
@@ -107,16 +113,39 @@ class _AlbumScreenState extends State<AlbumScreen> {
   @override
   void dispose() {
     _searchController.dispose();
+    _titleCache.clear();
+    // Bu albümün thumbnail future'ları bellekte kalmasın.
+    final ids = _assets.map((a) => a.id).toList();
+    for (final id in ids) {
+      _AssetThumb._futures.remove(id);
+    }
     super.dispose();
   }
 
   Future<void> _loadPage() async {
-    final page = await _service.assets(
-      widget.albumId,
-      categoryId: widget.categoryId,
-      offset: _assets.length,
-      size: _pageSize,
-    );
+    // Guard: itemBuilder aynı anda birkaç kez çağırabilir; istek sürerken
+    // ikinci istek aynı sayfayı mükerrer çeker.
+    if (_fetching || !_hasMore) return;
+    _fetching = true;
+    late final List<AssetEntity> page;
+    try {
+      page = await _service.assets(
+        widget.albumId,
+        categoryId: widget.categoryId,
+        offset: _assets.length,
+        size: _pageSize,
+      );
+    } catch (_) {
+      _fetching = false;
+      if (mounted) {
+        setState(() {
+          _loading = false;
+          _hasMore = false;
+        });
+      }
+      return;
+    }
+    _fetching = false;
     if (!mounted) return;
     setState(() {
       _assets.addAll(page);
@@ -762,6 +791,7 @@ class _AlbumScreenState extends State<AlbumScreen> {
                           _visibleCache = null;
                         });
                         MediaService.clearCache();
+                        _AssetThumb._futures.clear();
                         await _loadPage();
                       case 'select_all':
                         setState(() {
@@ -879,10 +909,19 @@ class _AssetThumb extends StatelessWidget {
 
   final AssetEntity asset;
 
+  /// Varlık başına tek thumbnail isteği (id → future).
+  ///
+  /// `build` içinde future üretilirse ızgaranın her rebuild'inde (seçim,
+  /// arama, yoğunluk değişimi) MediaStore'dan thumbnail yeniden okunur ve
+  /// görseller titrer. `media_category_screen`'deki cache deseninin aynısı.
+  static final Map<String, Future<Uint8List?>> _futures = {};
+
   @override
   Widget build(BuildContext context) {
     return FutureBuilder<Uint8List?>(
-      future: asset.thumbnailDataWithSize(const ThumbnailSize(300, 300)),
+      future: _futures.putIfAbsent(
+          asset.id,
+          () => asset.thumbnailDataWithSize(const ThumbnailSize(300, 300))),
       builder: (context, snapshot) {
         final data = snapshot.data;
         if (data == null) {

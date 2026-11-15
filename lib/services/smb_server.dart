@@ -44,6 +44,9 @@ class MiniSmbServer {
   final _log = StreamController<String>.broadcast();
   final _random = Random.secure();
 
+  /// Etkin istemci soketleri (`stop()` hepsini kapatır).
+  final _clients = <Socket>{};
+
   /// Sunucunun gerçekten dinlendiği port.
   ///
   /// Yapıcıya `0` verilirse işletim sistemi boş bir port tahsis eder; test
@@ -74,6 +77,17 @@ class MiniSmbServer {
   Future<void> stop() async {
     await _control?.close();
     _control = null;
+    // Etkin istemci soketleri de kapatılır; aksi halde "durdur"dan sonra
+    // açık oturumlar dosya okumaya/yazmaya devam edebiliyordu.
+    for (final s in _clients.toList()) {
+      try {
+        await s.close();
+      } catch (_) {}
+      try {
+        s.destroy();
+      } catch (_) {}
+    }
+    _clients.clear();
     _log.add('SMB sunucusu durdu.');
   }
 
@@ -84,6 +98,7 @@ class MiniSmbServer {
     } catch (_) {
       // Kapanan bağlantılar yutulur.
     } finally {
+      _clients.remove(socket);
       socket.destroy();
     }
   }
@@ -110,6 +125,18 @@ const int _cmdQueryDirectory = 0x000e;
 const int _cmdQueryInfo = 0x0010;
 const int _cmdSetInfo = 0x0011;
 const int _cmdEcho = 0x0013;
+
+/// Kimlik doğrulaması + bağlı paylaşım (TREE_CONNECT) gerektiren komutlar.
+const Set<int> _authRequiredCommands = {
+  _cmdCreate,
+  _cmdClose,
+  _cmdFlush,
+  _cmdRead,
+  _cmdWrite,
+  _cmdQueryDirectory,
+  _cmdQueryInfo,
+  _cmdSetInfo,
+};
 
 const int _statusSuccess = 0x00000000;
 const int _statusEndOfFile = 0xC0000011;
@@ -257,23 +284,38 @@ class _SmbSession {
 
   bool _authenticated = false;
   bool _treeConnected = false;
+
+  /// Başarısız oturum kurma denemesi (kaba kuvvet koruması).
+  int _authFailures = 0;
+  static const int _maxAuthFailures = 8;
+
+  /// Yanıt yazıldıktan sonra bağlantı kapatılacak mı (deneme limiti aşımı).
+  bool _closeAfterReply = false;
   /// Oturuma özel NTLM Tip-2 meydanı (8 bayt); tip-3 doğrulamasında kullanılır.
   Uint8List? _serverChallenge;
   final _handles = <String, _SmbHandle>{};
 
   Future<void> run() async {
     final iterator = StreamIterator(socket);
-    var remainder = <int>[];
+    // Kalan baytlar `BytesBuilder` ile tek geçişte tutulur. Önceden her
+    // okumada `remainder = [...remainder, ...chunk]` tüm tamponu kopyalıyordu
+    // (büyük WRITE'ta kuadratik davranış → telefonun donması).
+    final buffer = BytesBuilder(copy: false);
 
     Future<List<int>> readExact(int n) async {
-      while (remainder.length < n) {
+      // Tek mesaj üst sınırı (NetBIOS 16 MB bildirebilir; bellek DoS'u).
+      if (n > 16 * 1024 * 1024) {
+        throw const SocketException('SMB mesajı çok büyük');
+      }
+      while (buffer.length < n) {
         if (!await iterator.moveNext()) {
           throw const SocketException('bağlantı kapandı');
         }
-        remainder = [...remainder, ...iterator.current];
+        buffer.add(iterator.current);
       }
-      final out = Uint8List.fromList(remainder.sublist(0, n));
-      remainder = remainder.sublist(n);
+      final all = buffer.takeBytes();
+      final out = Uint8List.fromList(all.sublist(0, n));
+      if (all.length > n) buffer.add(all.sublist(n));
       return out;
     }
 
@@ -297,6 +339,7 @@ class _SmbSession {
       frame.setAll(4, response);
       socket.add(frame);
       await socket.flush();
+      if (_closeAfterReply) break;
     }
   }
 
@@ -325,6 +368,19 @@ class _SmbSession {
 
     int sid() => _authenticated ? 1 : 0;
     int tid() => _treeConnected ? 1 : 0;
+
+    // Güvenlik kapısı: oturum kurulmadan ve paylaşım bağlanmadan hiçbir dosya
+    // komutu çalıştırılamaz. (Elle yazılmış SMB2 paketiyle NEGOTIATE /
+    // SESSION_SETUP / TREE_CONNECT atlanıp doğrudan CREATE·READ·WRITE·
+    // SETINFO gönderilerek kimlik doğrulamanın baypas edilmesini engeller.)
+    if (_authRequiredCommands.contains(command) &&
+        (!_authenticated || !_treeConnected)) {
+      server._log.add(
+          'Reddedildi: kimliği doğrulanmamış oturumdan komut '
+          '0x${command.toRadixString(16)}.');
+      return _statusMsg(command, _statusAccessDenied, messageId,
+          creditCharge: creditCharge, creditReq: creditReq);
+    }
 
     switch (command) {
       case _cmdNegotiate:
@@ -459,15 +515,23 @@ class _SmbSession {
           );
       if (!ok) {
         server._log.add('SMB oturum reddedildi (yanlış kullanıcı/şifre).');
+        _authFailures++;
         body.u16(9);
         body.u16(0);
         body.u16(64 + 8);
         body.u16(0);
-        return _statusMsg(command, _statusLogonFailure, messageId,
+        final deny = _statusMsg(command, _statusLogonFailure, messageId,
             creditCharge: creditCharge, creditReq: creditReq, sessionId: 0,
             body: body.take());
+        // Kaba kuvvet koruması: eşik aşılınca bağlantı kapatılır.
+        if (_authFailures >= _maxAuthFailures) {
+          server._log.add('SMB: çok fazla hatalı giriş — bağlantı kapatıldı.');
+          _closeAfterReply = true;
+        }
+        return deny;
       }
       _authenticated = true;
+      _authFailures = 0;
       body.u16(9);
       body.u16(0); // session flags (guest değil)
       body.u16(64 + 8);

@@ -289,23 +289,35 @@ class GoogleDriveService {
   static Future<List<DriveFile>> list(String folderId) async {
     final q =
         "'${folderId.replaceAll("'", r"\'")}' in parents and trashed = false";
-    final data = await _json(
-      _apiBase.replace(
-        path: '${_apiBase.path}files',
-        queryParameters: {
-          'q': q,
-          'fields': 'files(id,name,mimeType,size,modifiedTime)',
-          'orderBy': 'folder,name',
-          'pageSize': '1000',
-        },
-      ),
-    );
-    final files = data['files'];
-    if (files is! List) return const [];
-    return files
-        .whereType<Map<String, Object?>>()
-        .map(DriveFile.fromJson)
-        .toList();
+    // Sayfalama: `nextPageToken` yok sayıldığında 1000+ öğeli klasörlerde
+    // liste sessizce kesiliyordu. Azami 50 sayfa (güvenlik sınırı).
+    final out = <DriveFile>[];
+    String? pageToken;
+    for (var page = 0; page < 50; page++) {
+      final data = await _json(
+        _apiBase.replace(
+          path: '${_apiBase.path}files',
+          queryParameters: {
+            'q': q,
+            'fields':
+                'nextPageToken,files(id,name,mimeType,size,modifiedTime)',
+            'orderBy': 'folder,name',
+            'pageSize': '1000',
+            'pageToken': ?pageToken,
+          },
+        ),
+      );
+      final files = data['files'];
+      if (files is List) {
+        out.addAll(files
+            .whereType<Map<String, Object?>>()
+            .map(DriveFile.fromJson));
+      }
+      final next = data['nextPageToken'];
+      if (next is! String || next.isEmpty) break;
+      pageToken = next;
+    }
+    return out;
   }
 
   /// Dosyayı yerel olarak indirir (Google belgeleri PDF olarak dışa aktarılır).
@@ -371,12 +383,15 @@ class GoogleDriveService {
           'Content-Type: $mime\r\n\r\n',
         );
 
+      // Toplam boyut döngü DIŞINDA bir kez okunur (her parçada `length()`
+      // çağrısı gereksiz dosya sistemi erişimiydi).
+      final total = await source.length();
       final stream = source.openRead();
       var sent = 0;
       await for (final chunk in stream) {
         sent += chunk.length;
         req.add(chunk);
-        onProgress?.call(sent, await source.length());
+        onProgress?.call(sent, total);
       }
       req.write('\r\n--$boundary--\r\n');
 

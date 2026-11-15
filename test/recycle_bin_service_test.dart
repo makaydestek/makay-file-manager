@@ -3,6 +3,7 @@ import 'dart:io';
 import 'package:flutter_test/flutter_test.dart';
 import 'package:makay_file_manager/models/file_entry.dart';
 import 'package:makay_file_manager/services/file_service.dart';
+// ignore: depend_on_referenced_packages
 import 'package:path_provider_platform_interface/path_provider_platform_interface.dart';
 
 import 'package:makay_file_manager/services/recycle_bin_service.dart';
